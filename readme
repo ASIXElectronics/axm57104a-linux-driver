@@ -1,0 +1,33 @@
+==============================================================================
+ASIX AXM57104 TSN Ethernet Switch PCIe card
+Driver Compilation & Configuration on Linux
+==============================================================================
+
+================
+Prerequisites
+================
+
+Prepare to build the driver, you need the Linux kernel sources installed on the
+build machine, and make sure that the version of the running kernel must match
+the installed kernel sources. If you don't have the kernel sources, you can get
+it from www.kernel.org or contact to your Linux distributor. If you don't know
+how to do, please refer to KERNEL-HOWTO.
+
+================
+Getting Start
+================
+
+1. Extract the compressed driver source file to your temporary directory by the
+   following command:
+
+	[root@localhost template]# tar -xf DRIVER_SOURCE_PACKAGE.tar.bz2
+
+2. Now, the driver source files should be extracted under the current directory.
+   Executing the following command to compile the driver and install the driver:
+ 
+	[root@localhost template]# make install
+
+If you want to remove the driver, just executing the following command:
+
+	[root@localhost anywhere]# make uninstall
+
