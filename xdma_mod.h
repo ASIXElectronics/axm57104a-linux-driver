@@ -1,6 +1,11 @@
 /******************************************************************************
  *     Copyright (c) 2020 ASIX Electronic Corporation All rights reserved.
  *
+ *     This is unpublished proprietary source code of ASIX Electronic
+ *     Corporation
+ *
+ *     The copyright notice above does not evidence any actual or intended
+ *     publication of such source code.
  *****************************************************************************/
 /*
  * This file is part of the Xilinx DMA IP Core driver for Linux
@@ -47,12 +52,22 @@
 #include "libxdma.h"
 #include "switch/ax_switch.h"
 
+
 #define VID_ASIX	0x125B
 
 #define MAGIC_ENGINE	0xEEEEEEEEUL
 #define MAGIC_DEVICE	0xDDDDDDDDUL
 #define MAGIC_CHAR	0xCCCCCCCCUL
 #define MAGIC_BITSTREAM 0xBBBBBBBBUL
+
+#define VENDOR_OUI_0      0x00
+#define VENDOR_OUI_1      0x0e
+#define VENDOR_OUI_2      0xc6
+#define CHECK_MAC_COUNT   2
+#define MAX_SLOT_NUM      32
+#define DOUBLE_SLOT_NUM   64
+#define TIME_SLOT_RESERVE 30000 //50us
+#define ETH_P_SDSA        0xDCDC
 
 /* XDMA PCIe device specific book-keeping */
 struct xdma_pci_dev {
@@ -72,5 +87,6 @@ struct xdma_pci_dev {
 	/* ASIX Network device */
 	struct ax_private *ax_netdev_priv;
 };
+
 
 #endif /* ifndef __XDMA_MODULE_H__ */

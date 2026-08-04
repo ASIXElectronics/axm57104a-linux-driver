@@ -1,6 +1,11 @@
 /******************************************************************************
  *     Copyright (c) 2020 ASIX Electronic Corporation All rights reserved.
  *
+ *     This is unpublished proprietary source code of ASIX Electronic
+ *     Corporation
+ *
+ *     The copyright notice above does not evidence any actual or intended
+ *     publication of such source code.
  *****************************************************************************/
 /*
  * This file is part of the Xilinx DMA IP Core driver for Linux
@@ -19,7 +24,7 @@
 
 #define DRV_MOD_MAJOR		1
 #define DRV_MOD_MINOR		0
-#define DRV_MOD_PATCHLEVEL	0	
+#define DRV_MOD_PATCHLEVEL	1
 
 #define DRV_MODULE_VERSION      \
 	__stringify(DRV_MOD_MAJOR) "." \
