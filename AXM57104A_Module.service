@@ -1,0 +1,8 @@
+[Unit]
+Description=AXM57104A driver module 
+
+[Service]
+ExecStart=/usr/local/bin/axm57104A_driver_install.sh
+
+[Install]
+WantedBy=multi-user.target

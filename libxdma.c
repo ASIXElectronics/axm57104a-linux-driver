@@ -1,6 +1,11 @@
 /******************************************************************************
  *     Copyright (c) 2020 ASIX Electronic Corporation All rights reserved.
  *
+ *     This is unpublished proprietary source code of ASIX Electronic
+ *     Corporation
+ *
+ *     The copyright notice above does not evidence any actual or intended
+ *     publication of such source code.
  *****************************************************************************/
 /*
  * This file is part of the Xilinx DMA IP Core driver for Linux
@@ -36,10 +41,10 @@
 #include "version.h"
 #define DRV_MODULE_NAME		"AXM57104"
 #define DRV_MODULE_DESC		"ASIX PCIe NIC Driver"
-#define DRV_MODULE_RELDATE	"2020/07"
+#define DRV_MODULE_RELDATE	"2023/07"
 
 static char version[] =
-        DRV_MODULE_DESC " " DRV_MODULE_NAME " v" DRV_MODULE_VERSION "\n";
+DRV_MODULE_DESC " " DRV_MODULE_NAME " v" DRV_MODULE_VERSION "\n";
 
 MODULE_AUTHOR("Xilinx, Inc.");
 MODULE_DESCRIPTION(DRV_MODULE_DESC);
@@ -48,8 +53,11 @@ MODULE_LICENSE("Dual BSD/GPL");
 #endif
 
 /* Module Parameters */
-static unsigned int enable_credit_mp = 0;
+static unsigned int enable_credit_mp;
 
+static unsigned int interrupt_mode;
+module_param(interrupt_mode, uint, 0644);
+MODULE_PARM_DESC(interrupt_mode, "0 - MSI-x , 1 - MSI, 2 - Legacy");
 /*
  * xdma device management
  * maintains a list of the xdma devices
@@ -59,19 +67,30 @@ static DEFINE_MUTEX(xdev_mutex);
 
 static LIST_HEAD(xdev_rcu_list);
 static DEFINE_SPINLOCK(xdev_rcu_lock);
-
 #ifndef list_last_entry
 #define list_last_entry(ptr, type, member) \
 		list_entry((ptr)->prev, type, member)
 #endif
 
+
+#ifdef IRQ_AFFINITY_HINT
+u32 channel_vector[3] = {0};
+u32 user_vector[8] = {0};
+#endif
+
+#ifdef ENABLE_TASKLET
+static void tasklet_ptp(unsigned long input);
+static struct tasklet_struct *tsk_ptp;
+struct ax_private *ax_local_tsk;
+#endif
+
+extern u32 ax_read_register(void *iomem);
 static inline void xdev_list_add(struct xdma_dev *xdev)
 {
 	mutex_lock(&xdev_mutex);
 	if (list_empty(&xdev_list)) {
 		xdev->idx = 0;
-	}
-	else {
+	} else {
 		struct xdma_dev *last;
 
 		last = list_last_entry(&xdev_list, struct xdma_dev, list_head);
@@ -104,17 +123,17 @@ static inline void xdev_list_remove(struct xdma_dev *xdev)
 
 struct xdma_dev *xdev_find_by_pdev(struct pci_dev *pdev)
 {
-        struct xdma_dev *xdev, *tmp;
+	struct xdma_dev *xdev, *tmp;
 
-        mutex_lock(&xdev_mutex);
-        list_for_each_entry_safe(xdev, tmp, &xdev_list, list_head) {
-                if (xdev->pdev == pdev) {
-                        mutex_unlock(&xdev_mutex);
-                        return xdev;
-                }
-        }
-        mutex_unlock(&xdev_mutex);
-        return NULL;
+	mutex_lock(&xdev_mutex);
+	list_for_each_entry_safe(xdev, tmp, &xdev_list, list_head) {
+		if (xdev->pdev == pdev) {
+			mutex_unlock(&xdev_mutex);
+			return xdev;
+		}
+	}
+	mutex_unlock(&xdev_mutex);
+	return NULL;
 }
 EXPORT_SYMBOL_GPL(xdev_find_by_pdev);
 
@@ -144,14 +163,14 @@ static inline int debug_check_dev_hndl(const char *fname, struct pci_dev *pdev,
 
 #ifdef __LIBXDMA_DEBUG__
 /* SECTION: Function definitions */
-inline void 
-__write_register(const char *fn, u32 value, void *iomem, unsigned long off)
+inline void __write_register
+(const char *fn, u32 value, void *iomem, unsigned long off)
 {
 	iowrite32(value, iomem);
 }
-#define write_register(v,mem,off) __write_register(__func__, v, mem, off)
+#define write_register(v, mem, off) __write_register(__func__, v, mem, off)
 #else
-#define write_register(v,mem,off) iowrite32(v, mem)
+#define write_register(v, mem, off) iowrite32(v, mem)
 #endif
 
 inline u32 read_register(void *iomem)
@@ -169,7 +188,6 @@ static inline u64 build_u64(u64 hi, u64 lo)
 	return ((hi & 0xFFFFFFFULL) << 32) | (lo & 0xFFFFFFFFULL);
 }
 
-//
 static void check_nonzero_interrupt_status(struct xdma_dev *xdev)
 {
 	struct interrupt_regs *reg = (struct interrupt_regs *)
@@ -220,6 +238,56 @@ static void channel_interrupts_enable(struct xdma_dev *xdev, u32 mask)
 	write_register(mask, &reg->channel_int_enable_w1s, XDMA_OFS_INT_CTRL);
 }
 
+#ifdef CONFIG_NAPI
+static void channel_interrupts_enable_polling(struct xdma_dev *xdev, u32 mask)
+{
+	struct interrupt_regs *reg = (struct interrupt_regs *)
+		(xdev->bar[xdev->config_bar_idx] + XDMA_OFS_INT_CTRL);
+
+	iowrite32(mask, &reg->channel_int_enable_w1s);
+}
+#endif
+
+static void msi_x_C2H_channel_interrupts_disable
+(struct xdma_engine *engine, u32 mask)
+{
+	write_register(mask,
+			&engine->regs->interrupt_enable_mask_w1c,
+			(unsigned long)
+			(&engine->regs->interrupt_enable_mask_w1c) -
+			(unsigned long)(&engine->regs));
+}
+
+static void msi_x_C2H_channel_interrupts_enable
+(struct xdma_engine *engine, u32 mask)
+{
+	write_register(mask,
+			&engine->regs->interrupt_enable_mask_w1s,
+			(unsigned long)
+			(&engine->regs->interrupt_enable_mask_w1s) -
+			(unsigned long)(&engine->regs));
+}
+
+static void msi_x_H2C_channel_interrupts_disable
+(struct xdma_engine *engine, u32 mask)
+{
+	write_register(mask,
+			&engine->regs->interrupt_enable_mask_w1c,
+			(unsigned long)
+			(&engine->regs->interrupt_enable_mask_w1c) -
+			(unsigned long)(&engine->regs));
+}
+
+static void msi_x_H2C_channel_interrupts_enable
+		(struct xdma_engine *engine, u32 mask)
+{
+	write_register(mask,
+			&engine->regs->interrupt_enable_mask_w1s,
+			(unsigned long)
+			(&engine->regs->interrupt_enable_mask_w1s) -
+			(unsigned long)(&engine->regs));
+}
+
 /* channel_interrupts_disable -- Disable interrupts we not interested in */
 static void channel_interrupts_disable(struct xdma_dev *xdev, u32 mask)
 {
@@ -263,9 +331,7 @@ static u32 read_interrupts(struct xdma_dev *xdev)
 	dbg_io("ioread32(0x%p) returned 0x%08x (channel_int_request)\n",
 		&reg->channel_int_request, lo);
 
-	/* 
-	return interrupts: user in upper 16-bits, channel in lower 16-bits 
-	*/
+	/* return interrupts: user in upper 16-bits, channel in lower 16-bits */
 	return build_u32(hi, lo);
 }
 
@@ -323,7 +389,6 @@ static void engine_status_dump(struct xdma_engine *engine)
 	int len = 0;
 
 	len = sprintf(buf, "SG engine %s status: 0x%08x: ", engine->name, v);
-	
 	if ((v & XDMA_STAT_BUSY)) {
 		len += sprintf(buf + len, "BUSY,");
 	}
@@ -333,9 +398,8 @@ static void engine_status_dump(struct xdma_engine *engine)
 	if ((v & XDMA_STAT_DESC_COMPLETED)) {
 		len += sprintf(buf + len, "DESC_COMPL,");
 	}
-
-	/* common H2C & C2H */	
- 	if ((v & XDMA_STAT_COMMON_ERR_MASK)) {
+	/* common H2C & C2H */
+	if ((v & XDMA_STAT_COMMON_ERR_MASK)) {
 		if ((v & XDMA_STAT_ALIGN_MISMATCH)) {
 			len += sprintf(buf + len, "ALIGN_MISMATCH ");
 		}
@@ -383,9 +447,8 @@ static void engine_status_dump(struct xdma_engine *engine)
 			}
 			buf[len - 1] = ',';
 		}
-		
 	} else {
-		/* C2H only */
+	/* C2H only */
 		if ((v & XDMA_STAT_C2H_R_ERR_MASK)) {
 			len += sprintf(buf + len, "R:");
 			if ((v & XDMA_STAT_C2H_R_DECODE_ERR)) {
@@ -398,8 +461,8 @@ static void engine_status_dump(struct xdma_engine *engine)
 		}
 	}
 
-	/* common H2C & C2H */	
- 	if ((v & XDMA_STAT_DESC_ERR_MASK)) {
+	/* common H2C & C2H */
+	if ((v & XDMA_STAT_DESC_ERR_MASK)) {
 		len += sprintf(buf + len, "DESC_ERR:");
 		if ((v & XDMA_STAT_DESC_UNSUPP_REQ)) {
 			len += sprintf(buf + len, "UNSUPP_REQ ");
@@ -435,9 +498,14 @@ u32 engine_status_read(struct xdma_engine *engine, bool clear, bool dump)
 
 	/* read status register */
 	if (clear) {
+	#if 0
+		value = engine->status =
+                        read_register(&engine->regs->status_rc);		
+	#else
 		value = engine->status =
 			read_register(&engine->regs->status);
 		write_register(value, &engine->regs->status, 0);
+	#endif
 	} else
 		value = engine->status = read_register(&engine->regs->status);
 
@@ -458,7 +526,7 @@ void xdma_engine_stop(struct xdma_engine *engine)
 
 	BUG_ON(!engine);
 
-	ASIX_DEBUG("xdma_engine_stop(engine=%p)\n", engine);
+	ASIX_DEBUG("xdma_engine_stop(engine=%p), call by %s\n");
 
 	w = 0;
 	w |= (u32)XDMA_CTRL_IE_DESC_ALIGN_MISMATCH;
@@ -482,11 +550,10 @@ void xdma_engine_stop(struct xdma_engine *engine)
 
 static void engine_start_mode_config(struct xdma_engine *engine)
 {
-	u32 w;
+	u32 w = 0;
 
 	BUG_ON(!engine);
 
-	
 	w = XDMA_CTRL_IE_DESC_STOPPED;
 	w |= XDMA_CTRL_IE_DESC_COMPLETED;
 	w |= XDMA_CTRL_IE_DESC_ALIGN_MISMATCH;
@@ -537,10 +604,15 @@ static void engine_start_mode_config(struct xdma_engine *engine)
  */
 struct xdma_transfer *engine_start(struct xdma_engine *engine)
 {
-	struct xdma_transfer *transfer = engine->transfer;
-	dma_addr_t desc_bus = transfer->desc_bus;
 	u32 w;
 	int extra_adj = 0;
+	dma_addr_t desc_bus;
+	struct xdma_transfer *transfer = engine->transfer;
+
+	if (transfer == NULL)
+		return 0;
+
+	desc_bus = transfer->desc_bus;
 
 	/* engine must be idle */
 	BUG_ON(engine->running);
@@ -557,7 +629,7 @@ struct xdma_transfer *engine_start(struct xdma_engine *engine)
 	engine->desc_dequeued = 0;
 
 	desc_bus = transfer->list_desc[transfer->current_list];
-	
+
 	/* write lower 32-bit of bus address of transfer first descriptor */
 	w = cpu_to_le32(PCI_DMA_L(desc_bus));
 	dbg_tfr("iowrite32(0x%08x to 0x%p) (first_desc_lo)\n", w,
@@ -580,8 +652,8 @@ struct xdma_transfer *engine_start(struct xdma_engine *engine)
 		(unsigned long)(&engine->sgdma_regs));
 
 	dbg_tfr("ioread32(0x%p) (dummy read flushes writes).\n",
-		&engine->regs->status);	
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,1,0)
+			&engine->regs->status);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
 	mmiowb();
 #endif
 	engine_start_mode_config(engine);
@@ -591,178 +663,198 @@ struct xdma_transfer *engine_start(struct xdma_engine *engine)
 	engine->running = 1;
 	return transfer;
 }
+#if 0
+#ifndef arch_msi_check_device //remove from kernel
+int arch_msi_check_device(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+#endif
+#endif
+/* type = PCI_CAP_ID_MSI or PCI_CAP_ID_MSIX */
+static int msi_msix_capable(struct pci_dev *dev, int type)
+{
+	struct pci_bus *bus;
+//	int ret;
 
+	if (!dev || dev->no_msi)
+		return 0;
+
+	for (bus = dev->bus; bus; bus = bus->parent)
+		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI)
+			return 0;
+	/*
+	ret = arch_msi_check_device(dev, 1, type);
+	if (ret)
+		return 0;
+	*/
+
+	if (!pci_find_capability(dev, type))
+		return 0;
+
+	return 1;
+}
+
+
+static irqreturn_t msix_user_irq_service
+			(int irq, struct xdma_user_irq *user_irq)
+{
+	BUG_ON(!user_irq);
+	if (user_irq->handler) {
+		return IRQ_HANDLED;
+	}
+	return IRQ_HANDLED;
+}
 
 static irqreturn_t user_irq_service(int irq, struct xdma_user_irq *user_irq,
 				    struct ax_private *ax_local)
 {
 	BUG_ON(!user_irq);
-
 	if (user_irq->handler) {
 		return user_irq->handler(user_irq->user_idx, (void *)ax_local);
 	}
-
 	return IRQ_HANDLED;
 }
-
-static int
-ax_net_desc_clear(struct net_device *dev, u32 current_list)
+#if 0
+void showpktPTPInfo(PSKB_TSTAMP_MSG pSkbptp, int idx)
 {
-	struct ax_private	*ax_local = netdev_priv(dev);
-	struct xdma_dev		*xdev = ax_local->xdev;
-	struct xdma_engine 	*engine = &xdev->engine_c2h[0];
-	struct xdma_result 	*cyclic_result = engine->cyclic_result;
-	int			size_count, offset;
+	struct ax_switch *pSwitch = pSkbptp->pSwitch;
+        struct sk_buff *skb = pSkbptp->skb;
+        struct skb_shared_hwtstamps *shhwtstamps = skb_hwtstamps(skb);
+        unsigned char ptp_header[PTP_HDR_SIZE];
+        int ptp_msg_offset = pSkbptp->ptp_msg_offset;
 
-	size_count = ((RX_DESC_NUM / DESC_LIST_NUM) * 
-			sizeof(struct xdma_result));
-	offset = (current_list * (RX_DESC_NUM / DESC_LIST_NUM));
-	memset(&cyclic_result[offset], 0, size_count);
-	return 0;
+	CAPTURE_DATA ts_d;
+	skb_copy_from_linear_data_offset(skb, ptp_msg_offset,
+                                         ptp_header, PTP_HDR_SIZE);
+        ts_d.msg_type = *(ptp_header + PTP_MSG_TYPE_OFFSET) & 0x0F;
+        ts_d.sequence_id = ntohs(*(u16 *)(ptp_header + PTP_SEQ_ID_OFFSET));
+        ts_d.domain_number = *(ptp_header + PTP_SUBDOMAIN_OFFSET) & 0xFF;
+        ts_d.port_id = pSkbptp->port_tag;
+
+	printk("[PKT INFO,%d] port_id: ts_0x%x\n",idx,ts_d.port_id);
+        printk("[PKT INFO,%d] msg_type: ts_0x%x\n",idx,ts_d.msg_type);
+        printk("[PKT INFO,%d] sequence_id: ts_0x%x\n",idx,ts_d.sequence_id);
+        printk("[PKT INFO,%d] domain_number: ts_0x%x\n",idx,ts_d.domain_number);	
 }
-
-static void 
-ax_rx_check_timestamp(struct sk_buff *skb, struct ax_switch *pSwitch)
+#endif
+static void
+ax_rx_check_timestamp(struct sk_buff *skb, struct ax_switch *pSwitch, struct ax_private *ax_local)
 {
 	const struct ethhdr *eth;
 	SKB_TSTAMP_MSG msg;
-	u16 rx_ethertype, rx_ethertype_sec;
-	u16 tmp;
-	u8 vlan_size = 0;
-	bool isdsa =0;
-	u16 vlan_id = 0;
+	u16 tmp, rx_ethertype, source_port;
+	struct skb_shared_hwtstamps *shhwtstamps = skb_hwtstamps(skb);
+	u64 sec, nsec;
+	u64 time64;
+	unsigned long flags;
 
 	msg.skb = skb;
 	msg.pSwitch = pSwitch;
 	rx_ethertype = ntohs(skb->protocol);
-	if (rx_ethertype == 0xF8) {
-		isdsa = 1;
+
+	if (rx_ethertype == ETH_P_XDSA) {
 		eth = eth_hdr(skb);
 		rx_ethertype = ntohs(eth->h_proto);
-	}
-	skb_copy_from_linear_data_offset(skb, 2, &tmp, 2);
-	rx_ethertype_sec = ntohs(tmp);
 
-	if ((((rx_ethertype & 0xFF00) == 0x0000) ||
-	    ((rx_ethertype & 0xFF00) == 0x2000)) &&
-	    (rx_ethertype_sec == 0x88F7) && (isdsa == 1)) {
-		skb_copy_from_linear_data_offset(skb, 1, &tmp, 1);
-		vlan_id = (rx_ethertype & 0x0FF) >> 3;
-		vlan_size = 4;
-		skb_copy_from_linear_data_offset(skb, 2, &tmp, 2);
-		rx_ethertype = ntohs(tmp);
-	}
-	if (rx_ethertype == ETH_P_8021Q) {
-		skb_copy_from_linear_data_offset(skb, 0, &tmp, 2);
-		vlan_id = ntohs(tmp) & 0xFFF;
-		vlan_size = 4;
-		skb_copy_from_linear_data_offset(skb, 2, &tmp, 2);
-		rx_ethertype = ntohs(tmp);
-		if (rx_ethertype == ETH_P_8021Q) {
-			vlan_size = 8;
-			skb_copy_from_linear_data_offset(skb, 6, &tmp, 2);
+		if (rx_ethertype == AX_SDSA) {
+			skb_copy_from_linear_data_offset
+				(skb, AX_RX_PTPHDR_OFFSET_L2 + 2, &tmp, 2);
+
+			source_port = (ntohs(tmp) & 0x1FF8) >> 3;
+
+			skb_copy_from_linear_data_offset (skb,
+				AX_RX_PTPHDR_OFFSET_L2 + AX_SDSA_TAG_LENGTH_RX,
+				&tmp,
+				2);
 			rx_ethertype = ntohs(tmp);
-		}
-	}
-	if (((rx_ethertype & 0xFF00) == 0x0000) ||
-	    ((rx_ethertype & 0xFF00) == 0x2000)) {
-		skb_copy_from_linear_data_offset(skb, -2, &tmp, 2);
-		vlan_id = (rx_ethertype & 0x0FF) >> 3;
-		vlan_size = 4;
-		skb_copy_from_linear_data_offset(skb, 2, &tmp, 2);
-		rx_ethertype = ntohs(tmp);
-	}
-	if (rx_ethertype == ETH_P_IP) {
-		u8 transport_poto;
-		u16 dst_port;
-			skb_copy_from_linear_data_offset(skb, 
-			AX_IP_PROTO_OFFSET + vlan_size,
-			&transport_poto, 1);
-		if (transport_poto == IPPROTO_UDP) {
-			skb_copy_from_linear_data_offset(skb,
-				AX_UDP_PORT_OFFSET + vlan_size,
-				&dst_port, 2);
-			if (ntohs(dst_port) == AX_PTP_EVENT_PORT_NUM) {				
-				msg.ptp_msg_offset = AX_RX_PTPHDR_OFFSET_L3 +
-						     vlan_size;
-				msg.ptp_vlan_id = 0;
-				msg.port_tag = vlan_id;
-				ax_tsn_rx_hwtstamp(&msg);
+			if (rx_ethertype == ETH_P_1588) {
+				u8 msg_type;
+				skb_copy_from_linear_data_offset(skb,
+			AX_RX_PTPHDR_OFFSET_L2 + AX_SDSA_TAG_LENGTH_RX + 2,
+				&msg_type,
+				1);
+				if ((msg_type & 0xf) <= 7) {
+					msg.ptp_msg_offset =
+						AX_RX_PTPHDR_OFFSET_L2 +
+						AX_SDSA_TAG_LENGTH_RX + 2;
+					msg.ptp_vlan_id = 0;
+					msg.port_tag = source_port;
+					spin_lock_irqsave(&ax_local->txrx_timestamp_lock,flags);
+					ax_retrieve_rx_hw_timestamps(pSwitch);
+					//spin_unlock_irqrestore(&ax_local->txrx_timestamp_lock,flags);
+					ax_tsn_rx_hwtstamp(&msg);
+					spin_unlock_irqrestore(&ax_local->txrx_timestamp_lock,flags);
+				}
+			} else if (rx_ethertype == ETH_P_NET_LATENCY) {/*Netlatency Rx side as AXM57104*/
+				 sec = (u64)read_register(ax_local->xdev->bar[2] + 0x114);
+				 nsec = (u64)read_register(ax_local->xdev->bar[2] + 0x110);
+				 time64 = (sec * 1000000000) + nsec;
+				 shhwtstamps->hwtstamp = ns_to_ktime(time64);
+			} else if (rx_ethertype == ETH_P_IP) {
+				u8 transport_poto;
+				u16 dst_port;
+				skb_copy_from_linear_data_offset(skb,
+				AX_IP_PROTO_OFFSET + AX_SDSA_TAG_LENGTH_RX + 2,
+				&transport_poto, 1);
+				if (transport_poto == IPPROTO_UDP) {
+					skb_copy_from_linear_data_offset(skb,
+				AX_UDP_PORT_OFFSET + AX_SDSA_TAG_LENGTH_RX + 2,
+						&dst_port, 2);
+					if (ntohs(dst_port) ==
+						AX_PTP_EVENT_PORT_NUM) {
+						msg.ptp_msg_offset =
+							AX_RX_PTPHDR_OFFSET_L3 +
+							AX_SDSA_TAG_LENGTH_RX +
+							2;
+						msg.ptp_vlan_id = 0;
+						msg.port_tag = source_port;
+						spin_lock_irqsave(&ax_local->txrx_timestamp_lock,flags);
+						ax_retrieve_rx_hw_timestamps(pSwitch);
+						//spin_unlock_irqrestore(&ax_local->txrx_timestamp_lock,flags);
+						ax_tsn_rx_hwtstamp(&msg);
+						spin_unlock_irqrestore(&ax_local->txrx_timestamp_lock,flags);
+					}
+				}
 			}
-		}
-	} else if (rx_ethertype == ETH_P_1588) {
-		u8 msg_type;
-		skb_copy_from_linear_data_offset(
-			skb,
-			AX_RX_PTPHDR_OFFSET_L2 + vlan_size,
-			&msg_type, 1);
-		if ((msg_type & 0xF) <= 7) {
-			msg.ptp_msg_offset = 
-					AX_RX_PTPHDR_OFFSET_L2 + vlan_size;
-			msg.ptp_vlan_id = 0;
-			msg.port_tag = vlan_id;
-			ax_tsn_rx_hwtstamp(&msg);
 		}
 	}
 }
 
 
-static void 
+static void
 ax_tx_check_timestamp(struct sk_buff *skb, struct ax_switch *pSwitch)
 {
-	SKB_TSTAMP_MSG msg;	
-
+	u16 tmp, tx_ethertype, port_id = 0;
+	SKB_TSTAMP_MSG msg;
+	u8 msg_type;
 	msg.skb = skb;
 	msg.pSwitch = pSwitch;
+
 	if (skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) {
-		u16 tmp, tx_ethertype, vlan_id = 0;
-		u8 vlan_size = 0;
-
-		skb_copy_from_linear_data_offset(skb, 
-					AX_ETHTYPE_OFFSET, 
-					&tmp, 2);
+		skb_copy_from_linear_data_offset(skb, AX_ETHTYPE_OFFSET, &tmp,2);
 		tx_ethertype = ntohs(tmp);
-
-		if (tx_ethertype == ETH_P_8021Q) {
-			skb_copy_from_linear_data_offset(skb,
-				AX_ETHTYPE_OFFSET + 2,
-				&tmp, 2);
-			vlan_id = ntohs(tmp) & 0xFFF;
-			vlan_size = 4;
-			skb_copy_from_linear_data_offset(skb,
-				AX_ETHTYPE_OFFSET + 4,
-				&tmp, 2);
+		if (tx_ethertype == AX_SDSA) {
+			skb_copy_from_linear_data_offset(skb,AX_ETHTYPE_OFFSET + 4,&tmp, 2);
+			port_id = (ntohs(tmp) & 0x1FF8) >> 3;
+			skb_copy_from_linear_data_offset(skb,AX_ETHTYPE_OFFSET + AX_SDSA_TAG_LENGTH_TX,	&tmp,2);
 			tx_ethertype = ntohs(tmp);
-			if (tx_ethertype == ETH_P_8021Q) {
-				vlan_size = 8;
-				skb_copy_from_linear_data_offset(skb,
-					AX_ETHTYPE_OFFSET + 8,
-					&tmp, 2);
-				tx_ethertype = ntohs(tmp);
+			msg.ptp_vlan_id = 0;
+			msg.port_tag = port_id;
+			if (tx_ethertype == ETH_P_1588) {
+				skb_copy_from_linear_data_offset(skb,AX_ETHTYPE_OFFSET + AX_SDSA_TAG_LENGTH_TX + 2,&msg_type,1);
+				if ((msg_type & 0xF) <= 7) {
+					msg.ptp_msg_offset =
+						AX_TX_PTPHDR_OFFSET_L2 
+						+ AX_SDSA_TAG_LENGTH_TX;
+					ax_tsn_tx_hwtstamp(&msg);
+				}
+			} else if (tx_ethertype == ETH_P_IP) {
+				msg.ptp_msg_offset =
+				AX_TX_PTPHDR_OFFSET_L3 + AX_SDSA_TAG_LENGTH_TX;
+				ax_tsn_tx_hwtstamp(&msg);
 			}
 		}
-		if (((tx_ethertype & 0xFF00) == 0x4000) ||
-		    ((tx_ethertype & 0xFF00) == 0x6000)) {
-			skb_copy_from_linear_data_offset(skb,
-				AX_ETHTYPE_OFFSET + 1,
-				&tmp, 1);
-			vlan_id = ((ntohs(tmp) >> 3) & 0xFF);
-			vlan_size = 4;
-			skb_copy_from_linear_data_offset(skb,
-				AX_ETHTYPE_OFFSET + 4,
-				&tmp, 2);
-			tx_ethertype = ntohs(tmp);
-		}
-		msg.ptp_vlan_id = 0;
-		msg.port_tag = vlan_id;
-		if (tx_ethertype == ETH_P_1588) {
-			msg.ptp_msg_offset = AX_TX_PTPHDR_OFFSET_L2 +
-					     vlan_size;							
-		} else {
-			msg.ptp_msg_offset = AX_TX_PTPHDR_OFFSET_L3 +
-					     vlan_size;
-		}
-		ax_tsn_tx_hwtstamp(&msg);
 	}
 }
 
@@ -775,14 +867,13 @@ ax_tx_check_timestamp(struct sk_buff *skb, struct ax_switch *pSwitch)
  * assume 802.3 if the type field is short enough to be a length.
  * This is normal practice and works for any 'now in use' protocol.
  */
-static __be16 ax_eth_type_trans(struct sk_buff *skb, 
+static __be16 ax_eth_type_trans(struct sk_buff *skb,
 				struct ax_private *ax_local)
 {
 	struct net_device *dev = ax_local->dev;
 	unsigned short _service_access_point;
 	const unsigned short *sap;
 	const struct ethhdr *eth;
-	u32 i;
 
 	skb->dev = dev;
 	skb_reset_mac_header(skb);
@@ -793,7 +884,7 @@ static __be16 ax_eth_type_trans(struct sk_buff *skb,
 	if (unlikely(!ether_addr_equal_64bits(eth->h_dest,
 					      dev->dev_addr))) {
 		if (unlikely(is_multicast_ether_addr_64bits(eth->h_dest))) {
-			if (ether_addr_equal_64bits(eth->h_dest, 
+			if (ether_addr_equal_64bits(eth->h_dest,
 			dev->broadcast)) {
 				skb->pkt_type = PACKET_BROADCAST;
 			} else {
@@ -810,12 +901,10 @@ static __be16 ax_eth_type_trans(struct sk_buff *skb,
 	 * variants has been configured on the receiving interface,
 	 * and if so, set skb->protocol without looking at the packet.
 	 */
-	if (unlikely(netdev_uses_dsa(dev))) {		
-		for (i = 0; i < 4; i++) {
-			unsigned char *dsa_mac = ax_local->ax_dsa.dsa_mac[i];
-			if (ether_addr_equal_64bits(dsa_mac, eth->h_dest)) {				
-				return htons(ETH_P_XDSA);
-			}
+	//if (unlikely(netdev_uses_dsa(dev))) {
+	if (unlikely(netdev_uses_dsa(dev))){
+		if (eth->h_proto == 0xDCDC) {
+			return htons(ETH_P_XDSA);
 		}
 	}
 
@@ -840,96 +929,179 @@ static __be16 ax_eth_type_trans(struct sk_buff *skb,
 	return htons(ETH_P_802_2);
 }
 
-static int ax_net_rx(struct ax_private *ax_local, int budget)
+static void ax_net_rx(struct ax_private *ax_local, int *work_done, int budget)
 {
 	struct xdma_dev 	*xdev = ax_local->xdev;
 	struct xdma_engine 	*engine = &xdev->engine_c2h[0];
 	struct xdma_result 	*cyclic_result = engine->cyclic_result;
 	struct sk_buff 		*skb;
+	
+#ifdef CONFIG_NAPI
 	struct napi_struct 	*napi = &ax_local->napi;
+#else
+	struct net_device	*netdev = ax_local->dev;
+#endif
 	struct packet_buff 	*rx_buff = engine->rx_buff;
 	u32 entry;
 	u32 length;
-	u16 count = 0;
-
+	
+#ifdef ASIX_GPTP_DEBUG
+	u16 rx_ethertype, tmp;
+	const struct ethhdr *eth;
+	struct timespec64 tmv_64;
+	u64 nanoSec;
+#endif
 	entry = ax_local->cur_rx;
-	while (((cyclic_result[entry].status & 0xFFFF0000) == C2H_WB) && budget) 
-	{
-		length = cyclic_result[entry].length;			
+	ASIX_DEBUG("[%s %d] cyclic_result status = %x ",
+			__FUNCTION__,
+			__LINE__,
+			cyclic_result[entry].status);
+	while (((cyclic_result[entry].status & 0xFFFF0000) == C2H_WB)
+			&& budget) {
+		if (*work_done >= budget) {			
+			break;
+		}		
+		length = cyclic_result[entry].length;
 
+#ifdef CONFIG_NAPI
 		skb = napi_alloc_skb(napi, length + 2);
-		if (skb == NULL) {
-			
-			goto next_pkt;
-		}
-		skb_reserve(skb, 2);
-		skb->dev = ax_local->dev;
-		memcpy(skb->data, rx_buff[entry].data, length);
-
-		skb_put(skb, length);	
-		skb->protocol = ax_eth_type_trans (skb, ax_local);
-
-		ax_rx_check_timestamp(skb, &ax_local->axswitch);
-
-#ifdef CONFIG_NAPA_NAPI
-		napi_gro_receive(napi, skb);
-		count++;
 #else
-		netif_rx(skb);	
-#endif /* End of CONFIG_NAPA_NAPI */		
+		skb = netdev_alloc_skb(netdev, length + 2);
+#endif
+		if (skb == NULL) {
+			ax_local->cur_rx = entry;			
+			return;
+		}
+
+		skb_reserve(skb, 2);
+		memcpy(skb->data, rx_buff[entry].data, length);
+	
+#if 0
+		printk("Rx:");
+		print_hex_dump(KERN_DEBUG,"",DUMP_PREFIX_NONE,16,1,skb->data,length,0);
+		printk("\r\n");
+#endif	
+		skb_put(skb, length);
+		skb->protocol = ax_eth_type_trans(skb, ax_local);
+#ifdef ASIX_GPTP_DEBUG
+		rx_ethertype = ntohs(skb->protocol);
+		if(rx_ethertype == ETH_P_XDSA)
+		{
+			eth = eth_hdr(skb);
+			rx_ethertype = ntohs(eth->h_proto);
+			if (rx_ethertype == AX_SDSA) {
+				skb_copy_from_linear_data_offset(skb, AX_RX_PTPHDR_OFFSET_L2 + 2, &tmp, 2);
+				skb_copy_from_linear_data_offset (skb,AX_RX_PTPHDR_OFFSET_L2 + AX_SDSA_TAG_LENGTH_RX,
+				&tmp,2);
+				rx_ethertype = ntohs(tmp);
+				if (rx_ethertype == ETH_P_1588) 
+				{
+					u8 msg_type;
+					skb_copy_from_linear_data_offset(skb,
+					AX_RX_PTPHDR_OFFSET_L2 + AX_SDSA_TAG_LENGTH_RX + 2,&msg_type,1);
+					if ((msg_type & 0xf) <= 7) 
+					{
+						if((msg_type & 0xf)==0x3){
+							ktime_get_real_ts64(&tmv_64);
+							nanoSec = ((u64)tmv_64.tv_sec)*1000000000+
+								(u64)tmv_64.tv_nsec;
+							printk("%s,T4, msg_type: %d, Kernel Time: %lld",\
+									__func__,msg_type&0xf,nanoSec);
+						}
+					}
+				}
+			}
+		}
+#endif
+		ax_rx_check_timestamp(skb, &ax_local->axswitch, ax_local);
+
+		(*work_done)++;
+#ifdef CONFIG_NAPI
+	#ifdef NETIF_F_GRO
+		napi_gro_receive(napi, skb);
+	#else
+		netif_receive_skb(skb);
+	#endif
+#else
+		netif_rx(skb);
+#endif /* End of CONFIG_NAPI */
 
 		ax_local->net_stats.rx_bytes += length;
 		ax_local->net_stats.rx_packets++;
 		ax_local->cur_rx_pkt_count++;
-next_pkt:
-		budget--;
-		entry = (entry + 1) % RX_DESC_NUM;
-		if ((entry == 0) || (entry == (RX_DESC_NUM / DESC_LIST_NUM))) {
-			ax_net_desc_clear(ax_local->dev, ax_local->rx_flags);
-			ax_local->rx_flags = (ax_local->rx_flags + 1) % 
-					     DESC_LIST_NUM;
-			break;
-		}
-	}
 
+		cyclic_result[entry].status = 0;
+		cyclic_result[entry].length = 0;
+		entry = (entry + 1) % RX_DESC_NUM;
+	}
+	
 	ax_local->cur_rx = entry;
 
-	return count;
 }
 
+#ifdef CONFIG_NAPI
 int ax_net_poll(struct napi_struct *napi, int budget)
 {
 	struct ax_private *ax_local =
 				container_of(napi, struct ax_private, napi);
 	struct xdma_dev *xdev = ax_local->xdev;
 	struct xdma_engine *engine = &xdev->engine_c2h[0];
-	int work_done;
-	work_done = ax_net_rx(ax_local, budget);
-	napi_complete_done(napi, budget);
-	channel_interrupts_enable(engine->xdev, engine->irq_bitmask);
+	int work_done = 0;
+	unsigned long flags;
 
+	ax_net_rx(ax_local, &work_done, budget);
+
+	if (work_done < budget) {
+		napi_complete(napi);
+		spin_lock_irqsave (&ax_local->lock, flags);
+		channel_interrupts_enable_polling(engine->xdev,
+							engine->irq_bitmask);
+		spin_unlock_irqrestore (&ax_local->lock, flags);
+
+	}
 	return work_done;
 }
+#endif
 
 /*
  * xdma_isr() - Interrupt handler
  *
  * @dev_id pointer to xdma_dev
  */
-static irqreturn_t xdma_isr(int irq, void *dev_id)
+//irqreturn_t xdma_isr(int irq, void *dev_id)
+static irqreturn_t xdma_isr(int irq, void *dev_id) //for kernel 6.8
 {
 	struct interrupt_regs *irq_regs;
 	struct xdma_dev *xdev;
-	u32 ch_irq;
-	u32 user_irq;
-	u32 mask;
-	
+	u32 ch_irq = 0, user_irq = 0, mask = 0, isr = 0;
+	bool handle = false;
+	unsigned long flags;
+	struct pci_dev *pdev;
+	struct xdma_pci_dev *xpdev;
+	struct ax_private *ax_local;
+	struct xdma_transfer *transfer;
+	struct xdma_engine *engine;
+	int channel = 0, max = 0;
+#ifndef CONFIG_NAPI
+	int work_done = 0;
+#endif
+#ifdef AX_MQ
+	u32 queue_index = 0;
+#endif
+	if (unlikely(dev_id == NULL)) {
+		return IRQ_NONE;
+	}
+
 	xdev = (struct xdma_dev *)dev_id;
-	if (!xdev) {
+	if (xdev == NULL) {
 		WARN_ON(!xdev);
 		dbg_irq("xdma_isr(irq=%d) xdev=%p ??\n", irq, xdev);
 		return IRQ_NONE;
 	}
+
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+	ax_local = xpdev->ax_netdev_priv;
 
 	irq_regs = (struct interrupt_regs *)
 		   (xdev->bar[xdev->config_bar_idx] + XDMA_OFS_INT_CTRL);
@@ -943,27 +1115,31 @@ static irqreturn_t xdma_isr(int irq, void *dev_id)
 	 */
 	if (ch_irq) {
 		channel_interrupts_disable(xdev, ch_irq);
+		handle = true;
 	}
-	
+
 	/* read user interrupts - this read also flushes the above write */
-	user_irq = read_register(xdev->bar[0] + SWITCH_ISR);	
+	user_irq = read_register(xdev->bar[0] + SWITCH_ISR);
+
+	ASIX_DEBUG("[%s]ch_irq = %x, user_irq = %x",
+					__FUNCTION__,
+					ch_irq,
+					user_irq);
 
 	if (user_irq) {
+		int user = 0;
 
-		struct pci_dev *pdev = xdev->pdev;
-		struct xdma_pci_dev *xpdev = dev_get_drvdata(&pdev->dev);
-		struct ax_private *ax_local = xpdev->ax_netdev_priv;
-		int user = 0;		
-
+		handle = true;
 		user_interrupts_disable(xdev, xdev->mask_irq_user);
-		ASIX_DEBUG("%s, %d, user_irq = %x", 
+		ASIX_DEBUG("%s, %d, user_irq = %x",
 				__FUNCTION__,
 				__LINE__,
 				 user_irq);
-		for (user = 0 ; user < 8 ; user++) {
-			mask = (1 << (16 + user));			
-			if (user_irq & mask) {				
-				write_register((user_irq & mask), 
+		//for (user = 0 ; user < 8 ; user++) {
+		for (user = 0 ; user < 16 ; user++) {
+			mask = (1 << (16 + user));
+			if (user_irq & mask) {
+				write_register((user_irq & mask),
 						xdev->bar[0] + SWITCH_ISR,
 						SWITCH_ISR);
 				user_irq &= ~(mask);
@@ -971,53 +1147,49 @@ static irqreturn_t xdma_isr(int irq, void *dev_id)
 						 ax_local);
 			}
 		}
-		ASIX_DEBUG("%s, %d, user_irq = %x", 
+		ASIX_DEBUG("%s, %d, user_irq = %x",
 				__FUNCTION__,
 				__LINE__,
 				 user_irq);
 		user_interrupts_enable(xdev, xdev->mask_irq_user);
 
 	}
-	
+	if (handle == false) {
+		goto out_unlock;
+	}
+
 	mask = ch_irq & xdev->mask_irq_h2c;
 	if (mask) {
-		int channel = 0;
-		unsigned long flags;
-		int max = xdev->h2c_channel_max;
-		struct pci_dev *pdev = xdev->pdev;
-		struct xdma_pci_dev *xpdev = dev_get_drvdata(&pdev->dev);
-		struct ax_private *ax_local = xpdev->ax_netdev_priv;
+		channel = 0;
+		max = xdev->h2c_channel_max;
 
 		spin_lock_irqsave (&ax_local->lock, flags);
 
 		/* iterate over H2C (PCIe read) */
 		for (channel = 0; channel < max && mask; channel++) {
-			struct xdma_engine *engine = 
-					&xdev->engine_h2c[channel];
-
+			engine = &xdev->engine_h2c[channel];
+			transfer = engine->transfer;
 			/* engine present and its interrupt fired? */
-			if((engine->irq_bitmask & mask) &&
+			if ((engine->irq_bitmask & mask) &&
 			   (engine->magic == MAGIC_ENGINE)) {
-				struct xdma_transfer *transfer = 
-							engine->transfer;
-				struct xdma_desc *desc_virt = 
+				struct xdma_desc *desc_virt =
 							transfer->desc_virt;
-				struct ax_tx_list *list = 
+				struct ax_tx_list *list =
 						&ax_local->tx_list[channel];
-				u32 isr = 0, complete;				
 
-				mask &= ~engine->irq_bitmask;				
+				u32 isr = 0, complete;
+
+				mask &= ~engine->irq_bitmask;
 
 				isr = engine_status_read(engine, 1, 0);
-				xdma_engine_stop(engine);				
-				
-				
+				xdma_engine_stop(engine);
+
 				complete = read_register(
 					&engine->regs->completed_desc_count);
 
 				if (list->cur_pkt_count != 0) {
 					u32 stop_desc;
-			
+
 					if (list->cur == 0) {
 						stop_desc = RX_DESC_NUM - 1;
 					} else {
@@ -1038,71 +1210,494 @@ static irqreturn_t xdma_isr(int irq, void *dev_id)
 
 					list->cur_pkt_count = 0;
 
-					list->idle = 0;					
+					list->idle = 0;
 				} else {
 					list->idle = 1;
 				}
-					
+
 				channel_interrupts_enable(engine->xdev,
 							  engine->irq_bitmask);
 				if (ax_local->stop_queue_channel == channel) {
+#ifdef AX_MQ
+					for (queue_index = 0 ;
+					queue_index < MAX_TX_QUEUE;
+					queue_index++) {
+						if (__netif_subqueue_stopped
+						(ax_local->dev, queue_index)) {
+							netif_wake_subqueue(
+							ax_local->dev
+							, queue_index);
+						}
+					}
+#else
 					if (netif_queue_stopped(
 							ax_local->dev)) {
 						netif_wake_queue(
 							ax_local->dev);
 					}
+#endif
 					ax_local->stop_queue_channel = 0xFF;
-				}	
-			}			
+				}
+			}
 		}
-		spin_unlock_irqrestore(&ax_local->lock, flags);		
+		spin_unlock_irqrestore(&ax_local->lock, flags);
 	}
 
 	mask = ch_irq & xdev->mask_irq_c2h;
 	if (mask) {
-		int channel = 0;
-		int max = 1;//xdev->c2h_channel_max;
+		channel = 0;
+		max = 1;
+
 		for (channel = 0; channel < max && mask; channel++) {
-			struct xdma_engine *engine = 
-						&xdev->engine_c2h[channel];
 
-			if((engine->irq_bitmask & mask) &&
+			engine = &xdev->engine_c2h[channel];
+
+			if ((engine->irq_bitmask & mask) &&
 			   (engine->magic == MAGIC_ENGINE)) {
-				struct pci_dev *pdev = xdev->pdev;
-				struct xdma_pci_dev *xpdev = 
-						dev_get_drvdata(&pdev->dev);
-				struct ax_private *ax_local = 
-						xpdev->ax_netdev_priv;
-				struct xdma_transfer *transfer = 
-						engine->transfer;
-				u32 isr = 0;
-
+				transfer = engine->transfer;
 				mask &= ~engine->irq_bitmask;
 
 				isr = engine_status_read(engine, 1, 0);
 				if (isr & XDMA_STAT_DESC_STOPPED) {
-					xdma_engine_stop(engine);					
+					xdma_engine_stop(engine);
 					transfer->current_list =
-					(transfer->current_list + 1) % 
-								DESC_LIST_NUM;					
-					engine_start(engine);							
+					(transfer->current_list + 1) %
+								DESC_LIST_NUM;
+					engine_start(engine);
 				}
-#ifdef CONFIG_NAPA_NAPI
+#ifdef CONFIG_NAPI
 				napi_schedule(&ax_local->napi);
 #else
-				ax_net_rx(ax_local, 128);
+				ax_net_rx(ax_local, &work_done, 16);
 				channel_interrupts_enable(engine->xdev,
 							  engine->irq_bitmask);
-#endif /* End of CONFIG_NAPA_NAPI */
+#endif /* End of CONFIG_NAPI */
 
 			}
 		}
 	}
+out_unlock:
+	if (handle) {
+		return IRQ_HANDLED;
+	}
+	return IRQ_NONE;
+}
 
-	xdev->irq_count++;
+static irqreturn_t xdma_user_irq_timer_value_change(int irq, void *dev_id)
+{
+	struct xdma_user_irq *user_irq;
+	u32 user_IRQ = 0, mask = 0, irq_mask = 0;
+
+	dbg_irq("(irq=%d) <<<< INTERRUPT SERVICE ROUTINE\n", irq);
+
+	BUG_ON(!dev_id);
+	if (dev_id == NULL) {
+		return IRQ_NONE;
+	}
+	user_irq = (struct xdma_user_irq *)dev_id;
+
+	user_IRQ = read_register(user_irq->xdev->bar[0] + SWITCH_ISR);
+	if (user_IRQ & (1 << (16 + user_irq->user_idx))) {
+		irq_mask = user_irq->xdev->mask_irq_user & 	TIMER_VALUE_CHANGE_BIT;
+		user_interrupts_disable(user_irq->xdev, irq_mask);
+
+		mask = (1 << (16 + user_irq->user_idx));
+		write_register(mask,
+				user_irq->xdev->bar[0] + SWITCH_ISR,
+				SWITCH_ISR);
+		return user_irq->handler(user_irq->user_idx, user_irq->dev);
+	}
+	return IRQ_NONE;
+}
+
+static irqreturn_t xdma_user_irq_timer_change(int irq, void *dev_id)
+{
+	struct xdma_user_irq *user_irq;
+	u32 user_IRQ = 0, mask = 0, irq_mask = 0;
+
+	dbg_irq("(irq=%d) <<<< INTERRUPT SERVICE ROUTINE\n", irq);
+
+	BUG_ON(!dev_id);
+	if (dev_id == NULL) {
+		return IRQ_NONE;
+	}
+	user_irq = (struct xdma_user_irq *)dev_id;
+
+	user_IRQ = read_register(user_irq->xdev->bar[0] + SWITCH_ISR);
+	if (user_IRQ & (1 << (16 + user_irq->user_idx))) {
+		irq_mask = user_irq->xdev->mask_irq_user & TIMER_CHANGE_BIT;
+		user_interrupts_disable(user_irq->xdev, irq_mask);
+
+		mask = (1 << (16 + user_irq->user_idx));
+		write_register(mask,
+				user_irq->xdev->bar[0] + SWITCH_ISR,
+				SWITCH_ISR);
+		return user_irq->handler(user_irq->user_idx, user_irq->dev);
+	}
+	return IRQ_NONE;
+}
+
+static irqreturn_t xdma_user_irq_config_change(int irq, void *dev_id)
+{
+	struct xdma_user_irq *user_irq;
+	u32 user_IRQ = 0, mask = 0, irq_mask = 0;
+
+	dbg_irq("(irq=%d) <<<< INTERRUPT SERVICE ROUTINE\n", irq);
+
+	BUG_ON(!dev_id);
+	if (dev_id == NULL) {
+		return IRQ_NONE;
+	}
+	user_irq = (struct xdma_user_irq *)dev_id;
+
+	user_IRQ = read_register(user_irq->xdev->bar[0] + SWITCH_ISR);
+	if (user_IRQ & (1 << (16 + user_irq->user_idx))) {
+
+		irq_mask = user_irq->xdev->mask_irq_user & CONFIG_CHANGE_BIT;
+		user_interrupts_disable(user_irq->xdev, irq_mask);
+
+		mask = (1 << (16 + user_irq->user_idx));
+		write_register(mask,
+				user_irq->xdev->bar[0] + SWITCH_ISR,
+				SWITCH_ISR);
+		return user_irq->handler(user_irq->user_idx, user_irq->dev);
+	}
+	return IRQ_NONE;
+}
+
+/*
+ * xdma_user_irq() - Interrupt handler for user interrupts in MSI-X mode
+ *
+ * @dev_id pointer to xdma_dev
+ */
+static irqreturn_t xdma_user_irq(int irq, void *dev_id)
+{
+	struct xdma_user_irq *user_irq;
+	u32 user_IRQ = 0, mask = 0;
+
+	dbg_irq("(irq=%d) <<<< INTERRUPT SERVICE ROUTINE\n", irq);
+
+	BUG_ON(!dev_id);
+	if (dev_id == NULL) {
+		return IRQ_NONE;
+	}
+	user_irq = (struct xdma_user_irq *)dev_id;
+
+	user_IRQ = read_register(user_irq->xdev->bar[0] + SWITCH_ISR);
+	if (user_IRQ & (1 << (16 + user_irq->user_idx))) {
+		//xdev->user_irq handle function not enable interrupt
+		/*user_interrupts_disable(user_irq->xdev
+			, user_irq->xdev->mask_irq_user);*/
+		mask = (1 << (16 + user_irq->user_idx));
+		write_register(mask,
+				user_irq->xdev->bar[0] + SWITCH_ISR,
+				SWITCH_ISR);
+		return msix_user_irq_service(irq, user_irq);
+	}
+	return IRQ_NONE;
+}
+
+static irqreturn_t xdma_channel_C2H_irq(int irq, void *dev_id)
+{
+	struct xdma_dev *xdev;
+	struct xdma_engine *engine;
+	struct interrupt_regs *irq_regs;
+	u32    ch_irq = 0, mask = 0, isr = 0, engine_desc = 0;
+	struct ax_private *ax_local;
+	struct pci_dev *pdev;
+	struct xdma_pci_dev *xpdev;
+	struct xdma_transfer *transfer;
+#ifndef CONFIG_NAPI
+	int work_done = 0;
+#endif
+
+	dbg_irq("(irq=%d) <<<< INTERRUPT service ROUTINE\n", irq);
+	BUG_ON(!dev_id);
+	
+	engine = (struct xdma_engine *)dev_id;
+	xdev = engine->xdev;
+
+	if (!xdev) {
+		WARN_ON(!xdev);
+		dbg_irq("xdma_channel_irq(irq=%d) xdev=%p ??\n", irq, xdev);
+		return IRQ_NONE;
+	}
+
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+	ax_local = xpdev->ax_netdev_priv;
+
+	irq_regs = (struct interrupt_regs *)(xdev->bar[xdev->config_bar_idx] +
+			XDMA_OFS_INT_CTRL);
+
+	/* read channel interrupt requests */
+	ch_irq = read_register(&irq_regs->channel_int_request);
+	mask = ch_irq & xdev->mask_irq_c2h;
+	if (mask) {
+		msi_x_C2H_channel_interrupts_disable(engine
+			, engine->interrupt_enable_mask_value);
+		/* Dummy read to flush the above write */
+		read_register(&irq_regs->channel_int_pending);
+		if ((engine->irq_bitmask & mask) &&
+		   (engine->magic == MAGIC_ENGINE)) {
+			transfer = engine->transfer;
+
+			isr = engine_status_read(engine, 1, 0);
+			engine_desc =
+			read_register(&engine->regs->completed_desc_count);
+			if ((isr & XDMA_STAT_DESC_STOPPED)
+			|| ((RX_DESC_NUM/DESC_LIST_NUM) == engine_desc)) {
+				xdma_engine_stop(engine);
+				transfer->current_list =
+				(transfer->current_list + 1) % 	DESC_LIST_NUM;
+				engine_start(engine);
+			}
+#ifdef CONFIG_NAPI
+			napi_schedule(&ax_local->napi);
+#else
+			ax_net_rx(ax_local, &work_done, 128);
+#endif /* End of CONFIG_NAPI */
+
+		}
+		msi_x_C2H_channel_interrupts_enable(engine
+			, engine->interrupt_enable_mask_value);
+	}
 	return IRQ_HANDLED;
 }
 
+static irqreturn_t xdma_channel_H2C_PTP_irq(int irq, void *dev_id)
+{
+	struct xdma_dev *xdev;
+	struct xdma_engine *engine;
+	struct interrupt_regs *irq_regs;
+	u32 ch_irq = 0, mask = 0, isr = 0, stop_desc;
+	struct ax_private *ax_local;
+	struct pci_dev *pdev;
+	struct xdma_pci_dev *xpdev;
+	int channel = 0;
+	struct xdma_transfer *transfer;
+	unsigned long flags;
+	struct xdma_desc *desc_virt;
+	struct ax_tx_list *list;
+#ifdef AX_MQ
+	u32 queue_index = 0;
+#endif
+	dbg_irq("(irq=%d) <<<< INTERRUPT service ROUTINE\n", irq);
+	BUG_ON(!dev_id);
+
+	engine = (struct xdma_engine *)dev_id;
+	xdev = engine->xdev;
+
+	if (!xdev) {
+		WARN_ON(!xdev);
+		dbg_irq("xdma_channel_irq(irq=%d) xdev=%p ??\n", irq, xdev);
+		return IRQ_NONE;
+	}
+
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+	ax_local = xpdev->ax_netdev_priv;
+
+	irq_regs = (struct interrupt_regs *)(xdev->bar[xdev->config_bar_idx] +
+			XDMA_OFS_INT_CTRL);
+
+
+	/* read channel interrupt requests */
+	ch_irq = read_register(&irq_regs->channel_int_request);
+	mask = ch_irq & xdev->mask_irq_h2c;
+
+	if (mask) {
+		msi_x_H2C_channel_interrupts_disable(engine
+				, engine->interrupt_enable_mask_value);
+		/* Dummy read to flush the above write */
+		read_register(&irq_regs->channel_int_pending);
+
+		channel = 1;
+		spin_lock_irqsave (&ax_local->lock, flags);
+
+		transfer = engine->transfer;
+			/* engine present and its interrupt fired? */
+		if ((engine->irq_bitmask & mask)
+			&& (engine->magic == MAGIC_ENGINE)) {
+			desc_virt = transfer->desc_virt;
+			list = &ax_local->tx_list[channel];
+
+
+			isr = engine_status_read(engine, 1, 0);
+			xdma_engine_stop(engine);
+
+#ifdef ENABLE_TASKLET
+			ax_local_tsk = ax_local;
+			tasklet_schedule(tsk_ptp);
+#endif
+			if (list->cur_pkt_count != 0) {
+				if (list->cur == 0) {
+					stop_desc = RX_DESC_NUM - 1;
+				} else {
+					stop_desc = list->cur - 1;
+				}
+				desc_virt[stop_desc].control =
+					cpu_to_le32(DESC_MAGIC |
+						    XDMA_DESC_EOP |
+						    XDMA_DESC_STOPPED);
+
+				engine_start(engine);
+				transfer->current_list =
+					((transfer->current_list + 1) %
+					DESC_LIST_NUM);
+				list->cur =
+					(transfer->current_list *
+					(TX_DESC_NUM / DESC_LIST_NUM));
+
+				list->cur_pkt_count = 0;
+
+				list->idle = 0;
+			} else {
+				list->idle = 1;
+			}
+
+			if (ax_local->stop_queue_channel == channel) {
+#ifdef AX_MQ
+				for (queue_index = 0;
+						queue_index < MAX_TX_QUEUE;
+						queue_index++) {
+					if (__netif_subqueue_stopped
+					(ax_local->dev, queue_index)) {
+						netif_wake_subqueue(
+						ax_local->dev
+						, queue_index);
+					}
+				}
+#else
+				if (netif_queue_stopped(ax_local->dev)) {
+					netif_wake_queue(ax_local->dev);
+				}
+#endif
+				ax_local->stop_queue_channel = 0xFF;
+			}
+		}
+		msi_x_H2C_channel_interrupts_enable(engine,
+					engine->interrupt_enable_mask_value);
+		spin_unlock_irqrestore(&ax_local->lock, flags);
+	}
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t xdma_channel_H2C_irq(int irq, void *dev_id)
+{
+	struct xdma_dev *xdev;
+	struct xdma_engine *engine;
+	struct interrupt_regs *irq_regs;
+	u32 ch_irq = 0, mask = 0, isr = 0, stop_desc;
+	struct ax_private *ax_local;
+	struct pci_dev *pdev;
+	struct xdma_pci_dev *xpdev;
+	int channel = 0;
+	struct xdma_transfer *transfer;
+	unsigned long flags;
+	struct xdma_desc *desc_virt;
+	struct ax_tx_list *list;
+#ifdef AX_MQ
+	u32 queue_index = 0;
+#endif
+	dbg_irq("(irq=%d) <<<< INTERRUPT service ROUTINE\n", irq);
+	BUG_ON(!dev_id);
+
+	engine = (struct xdma_engine *)dev_id;
+	xdev = engine->xdev;
+
+	if (!xdev) {
+		WARN_ON(!xdev);
+		dbg_irq("xdma_channel_irq(irq=%d) xdev=%p ??\n", irq, xdev);
+		return IRQ_NONE;
+	}
+
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+	ax_local = xpdev->ax_netdev_priv;
+
+	irq_regs = (struct interrupt_regs *)(xdev->bar[xdev->config_bar_idx] +
+			XDMA_OFS_INT_CTRL);
+
+	/* read channel interrupt requests */
+	ch_irq = read_register(&irq_regs->channel_int_request);
+	mask = ch_irq & xdev->mask_irq_h2c;
+	if (mask) {
+
+		msi_x_H2C_channel_interrupts_disable(engine
+				, engine->interrupt_enable_mask_value);
+		/* Dummy read to flush the above write */
+		read_register(&irq_regs->channel_int_pending);
+
+		channel = 0;
+		spin_lock_irqsave (&ax_local->lock, flags);
+
+		/* iterate over H2C (PCIe read) */
+		engine = &xdev->engine_h2c[channel];
+
+		transfer = engine->transfer;
+		/* engine present and its interrupt fired? */
+		if ((engine->irq_bitmask & mask) &&
+		   (engine->magic == MAGIC_ENGINE)) {
+			desc_virt = transfer->desc_virt;
+			list = &ax_local->tx_list[channel];
+
+			isr = engine_status_read(engine, 1, 0);
+			xdma_engine_stop(engine);
+			if (list->cur_pkt_count != 0) {
+
+				if (list->cur == 0) {
+					stop_desc = RX_DESC_NUM - 1;
+				} else {
+					stop_desc = list->cur - 1;
+				}
+				desc_virt[stop_desc].control =
+					cpu_to_le32(DESC_MAGIC |
+						    XDMA_DESC_EOP |
+						    XDMA_DESC_STOPPED);
+
+				engine_start(engine);
+				transfer->current_list =
+					((transfer->current_list + 1) %
+					DESC_LIST_NUM);
+				list->cur =
+					(transfer->current_list *
+					(TX_DESC_NUM / DESC_LIST_NUM));
+
+				list->cur_pkt_count = 0;
+
+				list->idle = 0;
+			} else {
+				list->idle = 1;
+			}
+
+			if (ax_local->stop_queue_channel == channel) {
+#ifdef AX_MQ
+				for (queue_index = 0;
+						queue_index < MAX_TX_QUEUE;
+						queue_index++) {
+					if (__netif_subqueue_stopped
+					(ax_local->dev, queue_index)) {
+						netif_wake_subqueue(
+						ax_local->dev
+						, queue_index);
+					}
+				}
+#else
+				if (netif_queue_stopped(ax_local->dev)) {
+					netif_wake_queue(ax_local->dev);
+				}
+#endif
+				ax_local->stop_queue_channel = 0xFF;
+			}
+		}
+		msi_x_H2C_channel_interrupts_enable(engine,
+					engine->interrupt_enable_mask_value);
+		spin_unlock_irqrestore(&ax_local->lock, flags);
+	}
+	return IRQ_HANDLED;
+}
 
 /*
  * Unmap the BAR regions that had been mapped earlier using map_bars()
@@ -1180,8 +1775,8 @@ static int is_config_bar(struct xdma_dev *xdev, int idx)
 	irq_id = read_register(&irq_regs->identifier);
 	cfg_id = read_register(&cfg_regs->identifier);
 
-	if (((irq_id & mask)== IRQ_BLOCK_ID) &&
-	    ((cfg_id & mask)== CONFIG_BLOCK_ID)) {
+	if (((irq_id & mask) == IRQ_BLOCK_ID) &&
+	    ((cfg_id & mask) == CONFIG_BLOCK_ID)) {
 		dbg_init("BAR %d is the XDMA config BAR\n", idx);
 		flag = 1;
 	} else {
@@ -1335,7 +1930,69 @@ fail:
 	return rv;
 }
 
-//
+static void disable_msi_msix(struct xdma_dev *xdev, struct pci_dev *pdev)
+{
+	if (xdev->msix_enabled) {
+		pci_disable_msix(pdev);
+		xdev->msix_enabled = 0;
+	} else if (xdev->msi_enabled) {
+		pci_disable_msi(pdev);
+		xdev->msi_enabled = 0;
+	}
+}
+
+static int enable_msi_msix(struct xdma_dev *xdev, struct pci_dev *pdev)
+{
+	int rv = 0;
+
+	BUG_ON(!xdev);
+	BUG_ON(!pdev);
+
+	if (!interrupt_mode && msi_msix_capable(pdev, PCI_CAP_ID_MSIX)) {
+		int req_nvec = xdev->c2h_channel_max + xdev->h2c_channel_max +
+				 xdev->user_max;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+		dbg_init("Enabling MSI-X\n");
+		ASIX_DEBUG("Enabling MSI-X");
+		rv = pci_alloc_irq_vectors(pdev, req_nvec, req_nvec,
+					PCI_IRQ_MSIX);
+#else
+		int i;
+		dbg_init("Enabling MSI-X\n");
+		ASIX_DEBUG("Enabling MSI-X");
+		for (i = 0; i < req_nvec; i++)
+			xdev->entry[i].entry = i;
+
+		rv = pci_enable_msix(pdev, xdev->entry, req_nvec);
+#endif
+		if (rv < 0) {
+			dbg_init("Couldn't enable MSI-X mode: %d\n", rv);
+			ASIX_DEBUG("Couldn't enable MSI-X mode");
+		}
+
+		xdev->msix_enabled = 1;
+
+	} else if (interrupt_mode == 1 &&
+		   msi_msix_capable(pdev, PCI_CAP_ID_MSI)) {
+		/* enable message signalled interrupts */
+		dbg_init("pci_enable_msi()\n");
+		ASIX_DEBUG("pci_enable_msi");
+		rv = pci_enable_msi(pdev);
+		if (rv < 0) {
+			dbg_init("Couldn't enable MSI mode: %d\n", rv);
+			ASIX_DEBUG("Couldn't enable MSI mode: %d", rv);
+		}
+		xdev->msi_enabled = 1;
+
+	} else {
+		dbg_init("MSI/MSI-X not detected - using legacy interrupts\n");
+		ASIX_DEBUG("MSI/MSI-X not detected - using legacy interrupts");
+	}
+
+	return rv;
+}
+
+
 static void pci_check_intr_pend(struct pci_dev *pdev)
 {
 	u16 v;
@@ -1343,7 +2000,7 @@ static void pci_check_intr_pend(struct pci_dev *pdev)
 	pci_read_config_word(pdev, PCI_STATUS, &v);
 	if (v & PCI_STATUS_INTERRUPT) {
 		pr_info("%s PCI STATUS Interrupt pending 0x%x.\n",
-                        dev_name(&pdev->dev), v);
+				dev_name(&pdev->dev), v);
 		pci_write_config_word(pdev, PCI_STATUS, PCI_STATUS_INTERRUPT);
 	}
 }
@@ -1366,6 +2023,371 @@ static void pci_keep_intx_enabled(struct pci_dev *pdev)
 	}
 }
 
+static void prog_irq_msix_user(struct xdma_dev *xdev, bool clear)
+{
+	/* user */
+	struct interrupt_regs *int_regs = (struct interrupt_regs *)
+					(xdev->bar[xdev->config_bar_idx] +
+					 XDMA_OFS_INT_CTRL);
+	u32 i = xdev->c2h_channel_max + xdev->h2c_channel_max;
+	u32 max = i + xdev->user_max;
+	int j;
+
+	for (j = 0; i < max; j++) {
+		u32 val = 0;
+		int k;
+		int shift = 0;
+
+		if (clear)
+			i += 4;
+		else
+			for (k = 0; k < 4 && i < max; i++, k++, shift += 8)
+				val |= (i & 0x1f) << shift;
+
+		write_register(val, &int_regs->user_msi_vector[j],
+			XDMA_OFS_INT_CTRL +
+			((unsigned long)&int_regs->user_msi_vector[j] -
+			 (unsigned long)int_regs));
+
+		dbg_init("vector %d, 0x%x.\n", j, val);
+	}
+}
+
+static void prog_irq_msix_channel(struct xdma_dev *xdev, bool clear)
+{
+	struct interrupt_regs *int_regs = (struct interrupt_regs *)
+					(xdev->bar[xdev->config_bar_idx] +
+					 XDMA_OFS_INT_CTRL);
+	u32 max = xdev->c2h_channel_max + xdev->h2c_channel_max;
+	u32 i;
+	int j;
+
+	/* engine */
+	for (i = 0, j = 0; i < max; j++) {
+		u32 val = 0;
+		int k;
+		int shift = 0;
+
+		if (clear) {
+			i += 4;
+		} else {
+			for (k = 0; k < 4 && i < max; i++, k++, shift += 8) {
+				val |= (i & 0x1f) << shift;
+			}
+		}
+		write_register(val, &int_regs->channel_msi_vector[j],
+			XDMA_OFS_INT_CTRL +
+			((unsigned long)&int_regs->channel_msi_vector[j] -
+			 (unsigned long)int_regs));
+		dbg_init("vector %d, 0x%x.\n", j, val);
+	}
+}
+
+static void irq_msix_channel_teardown(struct xdma_dev *xdev)
+{
+	struct xdma_engine *engine;
+	int j = 0;
+	int i = 0;
+
+	if (!xdev->msix_enabled)
+		return;
+
+	prog_irq_msix_channel(xdev, 1);
+
+	engine = xdev->engine_h2c;
+	for (i = 0; i < xdev->h2c_channel_max; i++, j++, engine++) {
+		if (!engine->msix_irq_line)
+			break;
+		dbg_sg("Release IRQ#%d for engine %p\n", engine->msix_irq_line,
+			engine);
+#ifdef IRQ_AFFINITY_HINT
+		irq_set_affinity_hint(channel_vector[i], NULL);
+#endif
+		free_irq(engine->msix_irq_line, engine);
+	}
+
+	engine = xdev->engine_c2h;
+	for (i = 0; i < xdev->c2h_channel_max; i++, j++, engine++) {
+		if (!engine->msix_irq_line)
+			break;
+		dbg_sg("Release IRQ#%d for engine %p\n", engine->msix_irq_line,
+			engine);
+#ifdef IRQ_AFFINITY_HINT
+		irq_set_affinity_hint(channel_vector[2], NULL);
+#endif
+		free_irq(engine->msix_irq_line, engine);
+	}
+#ifdef ENABLE_TASKLET
+	tasklet_kill(tsk_ptp);
+#endif
+}
+
+static int irq_msix_channel_setup(struct xdma_dev *xdev)
+{
+	int i, j = 0;
+	int rv = 0;
+	u32 vector;
+	struct xdma_engine *engine;
+
+	BUG_ON(!xdev);
+	if (!xdev->msix_enabled)
+		return 0;
+
+	j = xdev->h2c_channel_max;
+
+	engine = xdev->engine_h2c;
+	for (i = 0; i < xdev->h2c_channel_max; i++, engine++) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+		vector = pci_irq_vector(xdev->pdev, i);
+#else
+		vector = xdev->entry[i].vector;
+#endif
+
+		if (i == 0) {
+#ifdef IRQ_AFFINITY_HINT
+			rv = request_irq(vector
+				, xdma_channel_H2C_irq
+				, IRQF_NOBALANCING
+				, xdev->mod_name
+				, engine);
+#else
+			rv = request_irq(vector
+				, xdma_channel_H2C_irq
+				, 0
+				, xdev->mod_name
+				, engine);
+#endif
+		} else if (i == 1) {
+#ifdef IRQ_AFFINITY_HINT
+			rv = request_irq(vector
+				, xdma_channel_H2C_PTP_irq
+				, IRQF_NOBALANCING
+				, xdev->mod_name
+				, engine);
+#else
+			rv = request_irq(vector
+				, xdma_channel_H2C_PTP_irq
+				, 0
+				, xdev->mod_name
+				, engine);
+#endif
+		}
+		if (rv) {
+			ASIX_DEBUG("requesti irq#%d failed %d, engine %s.\n"
+				, vector, rv, engine->name);
+			pr_info("requesti irq#%d failed %d, engine %s.\n",
+				vector, rv, engine->name);
+			return rv;
+		}
+
+#ifdef IRQ_AFFINITY_HINT
+		channel_vector[i] = vector;
+		cpumask_set_cpu(1, &engine->affinity_mask);
+		cpumask_set_cpu(3, &engine->affinity_mask);
+//		cpumask_set_cpu(5, &engine->affinity_mask);
+//		cpumask_set_cpu(7, &engine->affinity_mask);
+		irq_set_affinity_hint(vector, &engine->affinity_mask);
+#endif
+
+		ASIX_DEBUG("engine %s, irq = %d", engine->name, vector);
+		pr_info("engine %s, irq#%d\n", engine->name, vector);
+		engine->msix_irq_line = vector;
+	}
+
+	engine = xdev->engine_c2h;
+	for (i = 0; i < xdev->c2h_channel_max; i++, j++, engine++) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+		vector = pci_irq_vector(xdev->pdev, j);
+#else
+		vector = xdev->entry[j].vector;
+#endif
+
+#ifdef IRQ_AFFINITY_HINT
+		rv = request_irq(vector, xdma_channel_C2H_irq, IRQF_NOBALANCING
+				, xdev->mod_name, engine);
+#else
+		rv = request_irq(vector, xdma_channel_C2H_irq, 0
+				, xdev->mod_name, engine);
+#endif
+		if (rv) {
+			ASIX_DEBUG("requesti irq#%d failed %d, engine %s.\n"
+				, vector, rv, engine->name);
+			pr_info("requesti irq#%d failed %d, engine %s.\n",
+				vector, rv, engine->name);
+			return rv;
+		}
+#ifdef IRQ_AFFINITY_HINT
+		channel_vector[2] = vector;
+		cpumask_set_cpu(1, &engine->affinity_mask);
+		cpumask_set_cpu(3, &engine->affinity_mask);
+//		cpumask_set_cpu(5, &engine->affinity_mask);
+//		cpumask_set_cpu(7, &engine->affinity_mask);
+		irq_set_affinity_hint(vector, &engine->affinity_mask);
+#endif
+		ASIX_DEBUG("engine %s, irq#%d.\n", engine->name, vector);
+		pr_info("engine %s, irq#%d.\n", engine->name, vector);
+		engine->msix_irq_line = vector;
+	}
+#ifdef ENABLE_TASKLET
+	tsk_ptp = kzalloc(sizeof(struct tasklet_struct), GFP_KERNEL);
+	tasklet_init(tsk_ptp, tasklet_ptp, 10);
+#endif
+	return 0;
+}
+
+static void irq_msix_user_teardown(struct xdma_dev *xdev)
+{
+	int i, j;
+
+	BUG_ON(!xdev);
+
+	if (!xdev->msix_enabled)
+		return;
+
+	j = xdev->h2c_channel_max + xdev->c2h_channel_max;
+
+	prog_irq_msix_user(xdev, 1);
+
+	for (i = 0; i < xdev->user_max; i++, j++) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+		u32 vector = pci_irq_vector(xdev->pdev, j);
+#else
+		u32 vector = xdev->entry[j].vector;
+#endif
+
+#ifdef IRQ_AFFINITY_HINT
+		irq_set_affinity_hint(user_vector[i], NULL);
+#endif
+		dbg_init("user %d, releasing IRQ#%d\n", i, vector);
+		free_irq(vector, &xdev->user_irq[i]);
+	}
+}
+
+static int irq_msix_user_setup(struct xdma_dev *xdev)
+{
+	int i;
+	int j = xdev->h2c_channel_max + xdev->c2h_channel_max;
+	int rv = 0;
+	u32 vector;
+
+	/* vectors set in probe_scan_for_msi() */
+	for (i = 0; i < xdev->user_max; i++, j++) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+		vector = pci_irq_vector(xdev->pdev, j);
+#else
+		vector = xdev->entry[j].vector;
+#endif
+		switch (i) {
+		case 0:
+		case 1:
+		case 2:
+		case 3:
+		case 4:
+		case 5:
+		case 6:
+		case 7:
+		case 11:
+		case 12:
+		case 13:
+		case 14:
+		case 15:
+				rv = request_irq(vector
+					, xdma_user_irq
+#ifdef IRQ_AFFINITY_HINT
+					, IRQF_NOBALANCING
+#else
+					, 0
+#endif
+					, xdev->mod_name
+					, &xdev->user_irq[i]);
+			break;
+		case 10:
+				rv = request_irq(vector
+					, xdma_user_irq_timer_value_change
+#ifdef IRQ_AFFINITY_HINT
+					, IRQF_NOBALANCING
+#else
+					, 0
+#endif
+					, xdev->mod_name
+					, &xdev->user_irq[i]);
+			break;
+		case 8:
+				rv = request_irq(vector
+					, xdma_user_irq_config_change
+#ifdef IRQ_AFFINITY_HINT
+					, IRQF_NOBALANCING
+#else
+					, 0
+#endif
+					, xdev->mod_name
+					, &xdev->user_irq[i]);
+			break;
+		case 9:
+				rv = request_irq(vector
+					, xdma_user_irq_timer_change
+#ifdef IRQ_AFFINITY_HINT
+					, IRQF_NOBALANCING
+#else
+					, 0
+#endif
+					, xdev->mod_name
+					, &xdev->user_irq[i]);
+			break;
+		}
+		if (rv) {
+			ASIX_DEBUG("user %d couldn't use IRQ#%d, %d"
+				, i, vector, rv);
+			pr_info("user %d couldn't use IRQ#%d, %d\n",
+				i, vector, rv);
+			break;
+		}
+#ifdef IRQ_AFFINITY_HINT
+		user_vector[i] = vector;
+		cpumask_set_cpu(1, &xdev->user_irq[i].affinity_mask);
+		cpumask_set_cpu(3, &xdev->user_irq[i].affinity_mask);
+//		cpumask_set_cpu(5, &xdev->user_irq[i].affinity_mask);
+//		cpumask_set_cpu(7, &xdev->user_irq[i].affinity_mask);
+		irq_set_affinity_hint(vector, &xdev->user_irq[i].affinity_mask);
+#endif
+		ASIX_DEBUG("%d-USR-%d, IRQ#%d with 0x%p\n"
+			, xdev->idx, i, vector,	&xdev->user_irq[i]);
+		pr_info("%d-USR-%d, IRQ#%d with 0x%p\n", xdev->idx, i, vector,
+			&xdev->user_irq[i]);
+	}
+
+	/* If any errors occur, free IRQs that were successfully requested */
+	if (rv) {
+		for (i--, j--; i >= 0; i--, j--) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+			vector = pci_irq_vector(xdev->pdev, j);
+#else
+			vector = xdev->entry[j].vector;
+#endif
+#ifdef IRQ_AFFINITY_HINT
+			irq_set_affinity_hint(user_vector[i], NULL);
+#endif
+			free_irq(vector, &xdev->user_irq[i]);
+		}
+	}
+
+	return rv;
+}
+
+
+static int irq_msi_setup(struct xdma_dev *xdev, struct pci_dev *pdev)
+{
+	int rv;
+
+	xdev->irq_line = (int)pdev->irq;
+	rv = request_irq(pdev->irq, xdma_isr, 0, xdev->mod_name, xdev);
+	if (rv)
+		dbg_init("Couldn't use IRQ#%d, %d\n", pdev->irq, rv);
+	else
+		dbg_init("Using IRQ#%d with 0x%p\n", pdev->irq, xdev);
+
+	return rv;
+}
 
 //
 static int irq_legacy_setup(struct xdma_dev *xdev, struct pci_dev *pdev)
@@ -1379,7 +2401,7 @@ static int irq_legacy_setup(struct xdma_dev *xdev, struct pci_dev *pdev)
 	dbg_init("Legacy Interrupt register value = %d\n", val);
 	if (val > 1) {
 		val--;
-		w = (val<<24) | (val<<16) | (val<<8)| val;
+		w = (val<<24) | (val<<16) | (val<<8) | val;
 		/* Program IRQ Block Channel vactor and IRQ Block User vector
 		 * with Legacy interrupt value */
 		reg = xdev->bar[xdev->config_bar_idx] + 0x2080;   // IRQ user
@@ -1406,13 +2428,36 @@ static int irq_legacy_setup(struct xdma_dev *xdev, struct pci_dev *pdev)
 
 static void irq_teardown(struct xdma_dev *xdev)
 {
-	dbg_init("Releasing IRQ#%d\n", xdev->irq_line);
-	free_irq(xdev->irq_line, xdev);
+	if (xdev->msix_enabled) {
+		irq_msix_channel_teardown(xdev);
+		irq_msix_user_teardown(xdev);
+	} else if (xdev->irq_line != -1) {
+		dbg_init("Releasing IRQ#%d\n", xdev->irq_line);
+		free_irq(xdev->irq_line, xdev);
+	}
 }
 
 static int irq_setup(struct xdma_dev *xdev, struct pci_dev *pdev)
 {
 	pci_keep_intx_enabled(pdev);
+
+	if (xdev->msix_enabled) {
+		int rv = irq_msix_channel_setup(xdev);
+		if (rv) {
+			return rv;
+		}
+		rv = irq_msix_user_setup(xdev);
+		if (rv) {
+			return rv;
+		}
+		prog_irq_msix_channel(xdev, 0);
+		prog_irq_msix_user(xdev, 0);
+
+		return 0;
+	} else if (xdev->msi_enabled) {
+		return irq_msi_setup(xdev, pdev);
+	}
+
 	return irq_legacy_setup(xdev, pdev);
 }
 
@@ -1421,24 +2466,32 @@ static void transfer_desc_init(struct xdma_transfer *transfer, int count)
 	struct xdma_desc *desc_virt = transfer->desc_virt;
 	dma_addr_t desc_bus = transfer->desc_bus;
 	int i, temp_count = count / DESC_LIST_NUM;
-	u32 list_count = 0;
-	u32 magic = 
-		cpu_to_le32(DESC_MAGIC | XDMA_DESC_COMPLETED | XDMA_DESC_EOP);
+	u32 list_count = 0; 
+	u32 magic =
+		cpu_to_le32(DESC_MAGIC | XDMA_DESC_COMPLETED | XDMA_DESC_EOP);	
 
-	BUG_ON(count > XDMA_TRANSFER_MAX_DESC);	
+	BUG_ON(count > XDMA_TRANSFER_MAX_DESC);
+
+	if(temp_count==0)
+		temp_count = 1;
 
 	transfer->list_desc[list_count++] = desc_bus;
-	for (i = 0; i < count; i++) {	
+	
+	for (i = 0; i < count; i++) {
 		desc_bus += sizeof(struct xdma_desc);
-		
-		if ((i % temp_count) == (temp_count - 1)) {
+		if ((i % temp_count) == (temp_count - 1)) {						
 			/* the last */
 			desc_virt[i].next_lo = cpu_to_le32(0);
-			desc_virt[i].next_hi = cpu_to_le32(0);			
+			desc_virt[i].next_hi = cpu_to_le32(0);
 			desc_virt[i].bytes   = cpu_to_le32(0);
 			desc_virt[i].control =
-					cpu_to_le32(magic | XDMA_DESC_STOPPED);			
-			transfer->list_desc[list_count++] = desc_bus;
+				cpu_to_le32(magic | XDMA_DESC_STOPPED);
+				
+			if(list_count< DESC_LIST_NUM)
+				transfer->list_desc[list_count++] = desc_bus;			
+			else
+				pr_warn("list_desc overflow at i=%d (list_count=%u)\n",i, list_count);
+
 		} else {
 			desc_virt[i].next_lo =
 					cpu_to_le32(PCI_DMA_L(desc_bus));
@@ -1459,7 +2512,7 @@ static void transfer_desc_init(struct xdma_transfer *transfer, int count)
  */
 static inline void xdma_desc_done(struct xdma_desc *desc_virt)
 {
-	memset(desc_virt, 0, 
+	memset(desc_virt, 0,
 			XDMA_TRANSFER_MAX_DESC * sizeof(struct xdma_desc));
 }
 
@@ -1473,7 +2526,7 @@ static inline void xdma_desc_done(struct xdma_desc *desc_virt)
 static int transfer_queue(struct xdma_engine *engine,
 		struct xdma_transfer *transfer)
 {
-	int rv = 0;	
+	int rv = 0;
 	struct xdma_dev *xdev;
 	unsigned long flags;
 
@@ -1598,19 +2651,19 @@ static void engine_destroy(struct xdma_dev *xdev, struct xdma_engine *engine)
 	write_register(0x0, &engine->regs->interrupt_enable_mask,
 			(unsigned long)(&engine->regs->interrupt_enable_mask) -
 			(unsigned long)(&engine->regs));
+	//init module parameters
+	enable_credit_mp = 0;
 
 	if (enable_credit_mp && engine->streaming &&
 		engine->dir == DMA_FROM_DEVICE) {
 		u32 reg_value = (0x1 << engine->channel) << 16;
 		struct sgdma_common_regs *reg = (struct sgdma_common_regs *)
 				(xdev->bar[xdev->config_bar_idx] +
-				 (0x6*TARGET_SPACING));	
+				 (0x6*TARGET_SPACING));
 		write_register(reg_value, &reg->credit_mode_enable_w1c, 0);
 	}
-
 	/* Release memory use for descriptor writebacks */
 	engine_free_resource(engine);
-
 	memset(engine, 0, sizeof(struct xdma_engine));
 	/* Decrement the number of engines available */
 	xdev->engines_num--;
@@ -1660,6 +2713,9 @@ static int engine_init_regs(struct xdma_engine *engine)
 
 	engine->interrupt_enable_mask_value = reg_value;
 
+	//init module parameters
+	enable_credit_mp = 0;
+
 	/* only enable credit mode for AXI-ST C2H */
 	if (enable_credit_mp && engine->streaming &&
 		engine->dir == DMA_FROM_DEVICE) {
@@ -1668,7 +2724,7 @@ static int engine_init_regs(struct xdma_engine *engine)
 		u32 reg_value = (0x1 << engine->channel) << 16;
 		struct sgdma_common_regs *reg = (struct sgdma_common_regs *)
 				(xdev->bar[xdev->config_bar_idx] +
-				 (0x6*TARGET_SPACING));	
+				 (0x6*TARGET_SPACING));
 
 		write_register(reg_value, &reg->credit_mode_enable_w1s, 0);
 	}
@@ -1684,6 +2740,7 @@ static int engine_alloc_resource(struct xdma_engine *engine)
 	engine->desc = dma_alloc_coherent(&xdev->pdev->dev,
 			XDMA_TRANSFER_MAX_DESC * sizeof(struct xdma_desc),
 			&engine->desc_bus, GFP_KERNEL);
+	
 	if (!engine->desc) {
 		pr_warn("dev %s, %s pre-alloc desc OOM.\n",
 			dev_name(&xdev->pdev->dev), engine->name);
@@ -1696,7 +2753,7 @@ static int engine_alloc_resource(struct xdma_engine *engine)
 			&engine->cyclic_result_bus, GFP_KERNEL);
 
 		if (!engine->cyclic_result) {
-                        pr_warn("%s, %s pre-alloc result OOM.\n",
+			pr_warn("%s, %s pre-alloc result OOM.\n",
 				dev_name(&xdev->pdev->dev), engine->name);
 			goto err_out;
 		}
@@ -1751,13 +2808,13 @@ static int engine_init(struct xdma_engine *engine, struct xdma_dev *xdev,
 
 	/* parent */
 	engine->xdev = xdev;
-	
+
 	/* register address */
 	engine->regs = (xdev->bar[xdev->config_bar_idx] + offset);
 	engine->sgdma_regs = xdev->bar[xdev->config_bar_idx] + offset +
 				SGDMA_OFFSET_FROM_CHANNEL;
 	val = read_register(&engine->regs->identifier);
-        if (val & 0x8000U) {
+	if (val & 0x8000U) {
 		engine->streaming = 1;
 	}
 
@@ -1773,6 +2830,7 @@ static int engine_init(struct xdma_engine *engine, struct xdma_dev *xdev,
 
 	if (dir == DMA_TO_DEVICE) {
 		xdev->mask_irq_h2c |= engine->irq_bitmask;
+
 	} else {
 		xdev->mask_irq_c2h |= engine->irq_bitmask;
 	}
@@ -1784,7 +2842,6 @@ static int engine_init(struct xdma_engine *engine, struct xdma_dev *xdev,
 		return rv;
 	}
 
-	//
 	rv = engine_init_regs(engine);
 	if (rv) {
 		return rv;
@@ -1794,14 +2851,19 @@ static int engine_init(struct xdma_engine *engine, struct xdma_dev *xdev,
 }
 
 
-int xdma_desc_setup(struct xdma_dev *xdev, struct xdma_engine *engine)
+int xdma_desc_setup
+(struct xdma_dev *xdev, struct xdma_engine *engine, int xdma_desc_flag)
 {
 	struct xdma_transfer *transfer;
 	enum dma_data_direction dir;
 	int num_desc_in_a_loop;
 
-	/* allocate transfer data structure */
-	transfer = kzalloc(sizeof(struct xdma_transfer), GFP_KERNEL);
+	if (xdma_desc_flag == 0) {
+		/* allocate transfer data structure */
+		transfer = kzalloc(sizeof(struct xdma_transfer), GFP_KERNEL);
+	} else {
+		transfer = engine->transfer;
+	}
 	BUG_ON(!transfer);
 
 	/* 0 = write engine (to_dev=0) , 1 = read engine (to_dev=1) */
@@ -1828,8 +2890,8 @@ int xdma_desc_setup(struct xdma_dev *xdev, struct xdma_engine *engine)
 	transfer->desc_virt = engine->desc;
 	transfer->desc_bus = engine->desc_bus;
 	transfer->current_list = 0;
-	
-	transfer_desc_init(transfer, transfer->desc_num);	
+
+	transfer_desc_init(transfer, transfer->desc_num);
 
 	dbg_sg("transfer->desc_bus = 0x%llx.\n", (u64)transfer->desc_bus);
 
@@ -1889,8 +2951,8 @@ static struct xdma_dev *alloc_dev_instance(struct pci_dev *pdev)
 	engine = xdev->engine_h2c;
 	for (i = 0; i < XDMA_CHANNEL_NUM_MAX; i++, engine++) {
 		spin_lock_init(&engine->lock);
-		spin_lock_init(&engine->desc_lock);		
-		init_waitqueue_head(&engine->shutdown_wq);		
+		spin_lock_init(&engine->desc_lock);
+		init_waitqueue_head(&engine->shutdown_wq);
 	}
 
 	engine = xdev->engine_c2h;
@@ -1903,7 +2965,6 @@ static struct xdma_dev *alloc_dev_instance(struct pci_dev *pdev)
 	return xdev;
 }
 
-//
 static int request_regions(struct xdma_dev *xdev, struct pci_dev *pdev)
 {
 	int rv;
@@ -1925,25 +2986,42 @@ static int request_regions(struct xdma_dev *xdev, struct pci_dev *pdev)
 	return rv;
 }
 
-//
 static int set_dma_mask(struct pci_dev *pdev)
 {
 	BUG_ON(!pdev);
 
 	dbg_init("sizeof(dma_addr_t) == %ld\n", sizeof(dma_addr_t));
 	/* 64-bit addressing capability for XDMA? */
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 17, 15)
+	if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(64))) {
+#else
 	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))) {
+#endif
 		/* query for DMA transfer */
 		/* @see Documentation/DMA-mapping.txt */
 		dbg_init("pci_set_dma_mask()\n");
 		/* use 64-bit DMA */
 		dbg_init("Using a 64-bit DMA mask.\n");
 		/* use 32-bit DMA for descriptors */
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 17, 15)
+		//dma_set_coherent_mask(&pdev->dev,DMA_BIT_MASK(32));
+		dma_set_mask_and_coherent(&pdev->dev,DMA_BIT_MASK(64));
+#else
 		pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
+#endif
 		/* use 64-bit DMA, 32-bit for consistent */
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 17, 15)
+	} else if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(32))) {
+#else
 	} else if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(32))) {
+#endif
 		dbg_init("Could not set 64-bit DMA mask.\n");
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 17, 15)
+		//dma_set_coherent_mask(&pdev->dev,DMA_BIT_MASK(32));
+		dma_set_mask_and_coherent(&pdev->dev,DMA_BIT_MASK(32));
+#else
 		pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
+#endif
 		/* use 32-bit DMA */
 		dbg_init("Using a 32-bit DMA mask.\n");
 	} else {
@@ -2035,8 +3113,8 @@ static int probe_for_engine(struct xdma_dev *xdev, enum dma_data_direction dir,
 	if ((engine_id != engine_id_expected) || (channel_id != channel)) {
 		dbg_init("%s %d engine, reg off 0x%x, id mismatch 0x%x,0x%x,"
 			"exp 0x%x,0x%x, SKIP.\n",
-		 	dir == DMA_TO_DEVICE ? "H2C" : "C2H",
-			 channel, offset, engine_id, channel_id,
+			dir == DMA_TO_DEVICE ? "H2C" : "C2H",
+			channel, offset, engine_id, channel_id,
 			engine_id_expected, channel_id != channel);
 		return -EINVAL;
 	}
@@ -2058,7 +3136,6 @@ static int probe_for_engine(struct xdma_dev *xdev, enum dma_data_direction dir,
 	return 0;
 }
 
-//
 static int probe_engines(struct xdma_dev *xdev)
 {
 	int i;
@@ -2084,8 +3161,7 @@ static int probe_engines(struct xdma_dev *xdev)
 	return 0;
 }
 
-//
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 5, 0)
 static void pci_enable_relaxed_ordering(struct pci_dev *pdev)
 {
 	pcie_capability_set_word(pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
@@ -2105,14 +3181,13 @@ static void pci_enable_relaxed_ordering(struct pci_dev *pdev)
 }
 #endif
 
-//
 static void pci_check_extended_tag(struct xdma_dev *xdev, struct pci_dev *pdev)
 {
 	u16 cap;
 	u32 v;
 	void *__iomem reg;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 5, 0)
 	pcie_capability_read_word(pdev, PCI_EXP_DEVCTL, &cap);
 #else
 	int pos;
@@ -2134,9 +3209,9 @@ static void pci_check_extended_tag(struct xdma_dev *xdev, struct pci_dev *pdev)
 	pr_info("0x%p EXT_TAG disabled.\n", pdev);
 
 	if (xdev->config_bar_idx < 0) {
-		pr_info("pdev 0x%p, xdev 0x%p, config bar UNKNOWN.\n",
-			pdev, xdev);
-                return;
+		pr_info("pdev 0x%p, xdev 0x%p, config bar UNKNOWN.\n", pdev,
+				xdev);
+		return;
 	}
 
 	reg = xdev->bar[xdev->config_bar_idx] + XDMA_OFS_CONFIG + 0x4C;
@@ -2150,6 +3225,8 @@ void *xdma_device_open(const char *mname, struct pci_dev *pdev, int *user_max,
 {
 	struct xdma_dev *xdev = NULL;
 	int rv = 0;
+	/* interrupt mode set MSI-X */
+	interrupt_mode = 0;
 
 	pr_info("%s device %s, 0x%p.\n", mname, dev_name(&pdev->dev), pdev);
 
@@ -2221,7 +3298,7 @@ void *xdma_device_open(const char *mname, struct pci_dev *pdev, int *user_max,
 		goto err_mask;
 	}
 
-	//
+	//check interrupt enable status
 	check_nonzero_interrupt_status(xdev);
 	/* explicitely zero all interrupt enable masks */
 	channel_interrupts_disable(xdev, ~0);
@@ -2233,6 +3310,10 @@ void *xdma_device_open(const char *mname, struct pci_dev *pdev, int *user_max,
 	if (rv) {
 		goto err_engines;
 	}
+
+	rv = enable_msi_msix(xdev, pdev);
+	if (rv < 0)
+		goto err_enable_msix;
 
 	rv = irq_setup(xdev, pdev);
 	if (rv < 0) {
@@ -2253,10 +3334,8 @@ void *xdma_device_open(const char *mname, struct pci_dev *pdev, int *user_max,
 
 err_interrupts:
 	irq_teardown(xdev);
-#if 0
 err_enable_msix:
 	disable_msi_msix(xdev, pdev);
-#endif
 err_engines:
 	remove_engines(xdev);
 err_mask:
@@ -2302,7 +3381,7 @@ void xdma_device_close(struct pci_dev *pdev, void *dev_hndl)
 	read_interrupts(xdev);
 
 	irq_teardown(xdev);
-//	disable_msi_msix(xdev, pdev);
+	disable_msi_msix(xdev, pdev);
 
 	remove_engines(xdev);
 	unmap_bars(xdev, pdev);
@@ -2328,22 +3407,23 @@ void xdma_device_offline(struct pci_dev *pdev, void *dev_hndl)
 	struct xdma_dev *xdev = (struct xdma_dev *)dev_hndl;
 	struct xdma_engine *engine;
 	int i;
+	unsigned long flags;
 
-	if (!dev_hndl)
+	if (!dev_hndl) {
 		return;
+	}
 
-	if (debug_check_dev_hndl(__func__, pdev, dev_hndl) < 0)
+	if (debug_check_dev_hndl(__func__, pdev, dev_hndl) < 0) {
 		return;
+	}
 
 	pr_info("pdev 0x%p, xdev 0x%p.\n", pdev, xdev);
 	xdma_device_flag_set(xdev, XDEV_FLAG_OFFLINE);
 
 	/* wait for all engines to be idle */
 	for (i  = 0; i < xdev->h2c_channel_max; i++) {
-		unsigned long flags;
 
 		engine = &xdev->engine_h2c[i];
-		
 		if (engine->magic == MAGIC_ENGINE) {
 			spin_lock_irqsave(&engine->lock, flags);
 			engine->shutdown |= ENGINE_SHUTDOWN_REQUEST;
@@ -2355,7 +3435,6 @@ void xdma_device_offline(struct pci_dev *pdev, void *dev_hndl)
 	}
 
 	for (i  = 0; i < xdev->c2h_channel_max; i++) {
-		unsigned long flags;
 
 		engine = &xdev->engine_c2h[i];
 		if (engine->magic == MAGIC_ENGINE) {
@@ -2397,6 +3476,7 @@ void xdma_device_online(struct pci_dev *pdev, void *dev_hndl)
 
 	for (i  = 0; i < xdev->h2c_channel_max; i++) {
 		engine = &xdev->engine_h2c[i];
+
 		if (engine->magic == MAGIC_ENGINE) {
 			engine_init_regs(engine);
 			spin_lock_irqsave(&engine->lock, flags);
@@ -2406,6 +3486,7 @@ void xdma_device_online(struct pci_dev *pdev, void *dev_hndl)
 	}
 
 	for (i  = 0; i < xdev->c2h_channel_max; i++) {
+
 		engine = &xdev->engine_c2h[i];
 		if (engine->magic == MAGIC_ENGINE) {
 			engine_init_regs(engine);
@@ -2420,7 +3501,7 @@ void xdma_device_online(struct pci_dev *pdev, void *dev_hndl)
 	channel_interrupts_enable(xdev, ~0);
 	user_interrupts_enable(xdev, xdev->mask_irq_user);
 	read_interrupts(xdev);
-	
+
 	xdma_device_flag_clear(xdev, XDEV_FLAG_OFFLINE);
 	pr_info("xdev 0x%p, done.\n", xdev);
 }
@@ -2442,19 +3523,39 @@ int xdma_device_restart(struct pci_dev *pdev, void *dev_hndl)
 }
 EXPORT_SYMBOL_GPL(xdma_device_restart);
 
-static irqreturn_t ax_tsn_irq_config_apply(int irq, void *lp)
-{
-	struct ax_private *ax_local = (struct ax_private *)lp;
-
-	ax_irq_config_apply(&ax_local->axswitch);
-	return IRQ_HANDLED;
-}
-
 static irqreturn_t ax_tsn_irq_timer_change(int irq, void *lp)
 {
 	struct ax_private *ax_local = (struct ax_private *)lp;
 
 	ax_irq_timer_change(&ax_local->axswitch);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t ax_msix_tsn_irq_timer_change(int irq, void *lp)
+{
+	struct xdma_dev *xdev;
+	struct ax_private *ax_local;
+	struct xdma_pci_dev *xpdev;
+	struct pci_dev *pdev;
+	u32    irq_mask = 0;
+
+	if (unlikely(lp == NULL)) {
+		return IRQ_NONE;
+	}
+
+	xdev = (struct xdma_dev *)lp;
+	if (xdev == NULL) {
+		WARN_ON(!xdev);
+		dbg_irq("[%s] (irq=%d) xdev=%p ??\n", __FUNCTION__, irq, xdev);
+		return IRQ_NONE;
+	}
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+	ax_local = xpdev->ax_netdev_priv;
+	ax_irq_timer_change(&ax_local->axswitch);
+
+	irq_mask = xdev->mask_irq_user & TIMER_CHANGE_BIT;
+	user_interrupts_enable(xdev, irq_mask);
 	return IRQ_HANDLED;
 }
 
@@ -2465,6 +3566,94 @@ static irqreturn_t ax_tsn_irq_config_change(int irq, void *lp)
 	ax_irq_config_change(&ax_local->axswitch);
 	return IRQ_HANDLED;
 }
+
+static irqreturn_t ax_msix_tsn_irq_config_change(int irq, void *lp)
+{
+	struct xdma_dev *xdev;
+	struct ax_private *ax_local;
+	struct xdma_pci_dev *xpdev;
+	struct pci_dev *pdev;
+	u32    irq_mask = 0;
+
+	if (unlikely(lp == NULL)) {
+		return IRQ_NONE;
+	}
+
+	xdev = (struct xdma_dev *)lp;
+	if (xdev == NULL) {
+		WARN_ON(!xdev);
+		dbg_irq("[%s] (irq=%d) xdev=%p ??\n", __FUNCTION__, irq, xdev);
+		return IRQ_NONE;
+	}
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+
+	ax_local = xpdev->ax_netdev_priv;
+	ax_irq_config_change(&ax_local->axswitch);
+
+	irq_mask = xdev->mask_irq_user & CONFIG_CHANGE_BIT;
+	user_interrupts_enable(xdev, irq_mask);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t ax_msix_tsn_irq_timer_value_change(int irq, void *lp)
+{
+	struct xdma_dev *xdev;
+	struct ax_private *ax_local;
+	struct xdma_pci_dev *xpdev;
+	struct pci_dev *pdev;
+	u32    irq_mask = 0;
+
+	if (unlikely(lp == NULL)) {
+		return IRQ_NONE;
+	}
+
+	xdev = (struct xdma_dev *)lp;
+	if (xdev == NULL) {
+		WARN_ON(!xdev);
+		dbg_irq("[%s] (irq=%d) xdev=%p ??\n", __FUNCTION__, irq, xdev);
+		user_interrupts_enable(xdev, xdev->mask_irq_user);
+		return IRQ_NONE;
+	}
+	pdev = xdev->pdev;
+	xpdev = dev_get_drvdata(&pdev->dev);
+
+	ax_local = xpdev->ax_netdev_priv;
+	ax_irq_timer_value_change(&ax_local->axswitch);
+
+	irq_mask = xdev->mask_irq_user & TIMER_VALUE_CHANGE_BIT;
+	user_interrupts_enable(xdev, irq_mask);
+	return IRQ_HANDLED;
+}
+
+#ifdef ENABLE_TASKLET
+static void tasklet_ptp(unsigned long input)
+{
+	struct sk_buff *tx_skb;
+
+
+	if (ax_local_tsk == NULL) {
+		return;
+	}
+
+	ASIX_DEBUG("[%s %d] netdev name = %s, queue length = %d"
+		, __FUNCTION__
+		, __LINE__
+		, ax_local_tsk->dev->name
+		, skb_queue_len(&ax_local_tsk->tx_timestamp));
+
+	while (skb_queue_len(&ax_local_tsk->tx_timestamp) != 0) {
+		tx_skb = __skb_dequeue(&ax_local_tsk->tx_timestamp);
+		if (!tx_skb) {
+			ASIX_DEBUG("[%s %d] tx_skb NULL"
+				, __FUNCTION__, __LINE__);
+			continue;
+		}
+		ax_tx_check_timestamp(tx_skb, &ax_local_tsk->axswitch);
+		dev_kfree_skb_irq(tx_skb);
+	}
+}
+#endif
 
 static irqreturn_t ax_tsn_irq_ptp(int irq, void *lp)
 {
@@ -2498,17 +3687,40 @@ tx:
 	return IRQ_HANDLED;
 }
 
-
-int xdma_user_isr_register(struct xdma_dev *xdev)
+int xdma_user_isr_register(struct xdma_dev *xdev, struct pci_dev *pdev)
 {
-	xdev->user_irq[0].handler = ax_tsn_irq_ptp;
-	xdev->user_irq[1].handler = NULL;
-	xdev->user_irq[2].handler = NULL;
-	xdev->user_irq[3].handler = NULL;
-	xdev->user_irq[4].handler = ax_tsn_irq_config_change;
-	xdev->user_irq[5].handler = ax_tsn_irq_config_apply;
-	xdev->user_irq[6].handler = ax_tsn_irq_timer_change;
+	int i = 0;
 
+	if (msi_msix_capable(pdev, PCI_CAP_ID_MSIX)) {
+		for (i = 0; i < MAX_USER_IRQ ; i++) {
+			xdev->user_irq[i].dev = xdev;
+		}
+		xdev->user_irq[0].handler = NULL;
+		xdev->user_irq[1].handler = NULL;
+		xdev->user_irq[2].handler = NULL;
+		xdev->user_irq[3].handler = NULL;
+		xdev->user_irq[4].handler = NULL;
+		xdev->user_irq[5].handler = NULL;
+		xdev->user_irq[6].handler = NULL;
+		xdev->user_irq[7].handler = NULL;
+		xdev->user_irq[8].handler = ax_msix_tsn_irq_config_change;
+		xdev->user_irq[9].handler = ax_msix_tsn_irq_timer_change;
+		xdev->user_irq[10].handler = ax_msix_tsn_irq_timer_value_change;
+		xdev->user_irq[11].handler = NULL;
+		xdev->user_irq[12].handler = NULL;
+		xdev->user_irq[13].handler = NULL;
+		xdev->user_irq[14].handler = NULL;
+		xdev->user_irq[15].handler = NULL;
+	} else {
+		xdev->user_irq[0].handler = ax_tsn_irq_ptp;
+		xdev->user_irq[1].handler = NULL;
+		xdev->user_irq[2].handler = NULL;
+		xdev->user_irq[3].handler = NULL;
+		xdev->user_irq[4].handler = ax_tsn_irq_config_change;
+		xdev->user_irq[5].handler = NULL;
+		xdev->user_irq[6].handler = ax_tsn_irq_timer_change;
+		xdev->user_irq[7].handler = NULL;
+	}
 	return 0;
 }
 

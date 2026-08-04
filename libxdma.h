@@ -1,6 +1,11 @@
 /******************************************************************************
  *     Copyright (c) 2020 ASIX Electronic Corporation All rights reserved.
  *
+ *     This is unpublished proprietary source code of ASIX Electronic
+ *     Corporation
+ *
+ *     The copyright notice above does not evidence any actual or intended
+ *     publication of such source code.
  *****************************************************************************/
 /*
  * This file is part of the Xilinx DMA IP Core driver for Linux
@@ -34,13 +39,22 @@
 #include <linux/mii.h>
 #include <linux/phy.h>
 #include <linux/timer.h>
-#include <net/dsa.h>
 
 #include "./switch/ax_switch.h"
+#include "DSA/dsa.h"
 
 #define ASIX_MSG(fmt, args...) \
 printk(fmt "\n", ##args)
 
+//#define AX_MQ
+#define VLAN_PRORITY_IND 14
+
+#ifdef AX_MQ
+#define MAX_TX_QUEUE    8
+#define PTP_QUEUE_INDEX 6
+#endif
+
+//#define ASIX_GPTP_DEBUG
 #ifdef AXM57104_DEBUG
 #define ASIX_DEBUG(fmt, args...) \
 printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
@@ -61,13 +75,21 @@ printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
 
 #define DESC_LIST_NUM		2
 
-#define CONFIG_NAPA_NAPI
+#define CONFIG_NAPI
+#define ETH_P_NET_LATENCY       0x808
+//#define IRQ_AFFINITY_HINT
+#define ENABLE_TASKLET
+#define FIFO_COUNT              18
+
+#define CONFIG_CHANGE_BIT       0x100
+#define TIMER_CHANGE_BIT        0x200
+#define TIMER_VALUE_CHANGE_BIT  0x400
 
 #define PHY_POLLING_TIMER	500	/* in milliseconds */
 
 /* Phy device */
 #define RTL8211FS_PHY_AD_SHIFT	0x01
-
+#define PHY_ID_SHIFT	0x01
 
 /* Switch debug printing on/off */
 #define XDMA_DEBUG 0
@@ -164,7 +186,7 @@ printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
 /* all combined */
 #define XDMA_STAT_H2C_ERR_MASK	\
 	(XDMA_STAT_COMMON_ERR_MASK | XDMA_STAT_DESC_ERR_MASK | \
-	 XDMA_STAT_H2C_R_ERR_MASK | XDMA_STAT_H2C_W_ERR_MASK) 
+	 XDMA_STAT_H2C_R_ERR_MASK | XDMA_STAT_H2C_W_ERR_MASK)
 
 #define XDMA_STAT_C2H_ERR_MASK	\
 	(XDMA_STAT_COMMON_ERR_MASK | XDMA_STAT_DESC_ERR_MASK | \
@@ -184,11 +206,11 @@ printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
 
 /* upper 16-bits of engine identifier register */
 /* DMA Subsystem for PCIe identifier + Channel target */
-#define XDMA_ID_H2C 0x1fc0U	
+#define XDMA_ID_H2C 0x1fc0U
 #define XDMA_ID_C2H 0x1fc1U
 
 /* for C2H AXI-ST mode */
-#define CYCLIC_RX_PAGES_MAX	RX_DESC_NUM	
+#define CYCLIC_RX_PAGES_MAX	RX_DESC_NUM
 
 #define LS_BYTE_MASK 0x000000FFUL
 
@@ -202,7 +224,11 @@ printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
 #define WB_ERR_MASK (1UL << 31)
 #define POLL_TIMEOUT_SECONDS 10
 
-#define MAX_USER_IRQ 8			// Default:16
+#if 0
+	#define MAX_USER_IRQ 4
+#else
+	#define MAX_USER_IRQ 16			// Default:16
+#endif
 
 #define MAX_DESC_BUS_ADDR (0xffffffffULL)
 
@@ -238,6 +264,8 @@ printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
 	#define VMEM_FLAGS (VM_IO | VM_RESERVED)
 #endif
 
+#define RTL8211R
+
 //#define __LIBXDMA_DEBUG__
 
 #ifdef __LIBXDMA_DEBUG__
@@ -267,7 +295,7 @@ printk(KERN_DEBUG "%s: "fmt "\n", __FUNCTION__, ##args)
 // ASIX NIC Control/Status Registers
 //-----------------------------------------------------------------------------
 enum {
-  MAC_MODULE_VERSION	= 0x0000,	/* MAC Module Version */  
+  MAC_MODULE_VERSION	= 0x0000,	/* MAC Module Version */
   RX_CTRL		= 0x0004,	/* RX Control */
 	#define AX_RX_CTL_PRO			(1 << 0)
 	#define AX_RX_CTL_AB			(1 << 1)
@@ -281,6 +309,7 @@ enum {
 	#define AX_PLINK			(1 << 0)
   SWITCH_ISR		= 0x0040,	/* Switch Interrupt Status Reg. */
 };
+#define AUTO_NEG_VEC_REG                0x1C
 #define AX_MCAST_FILTER_SIZE		8
 #define AX_MAX_MCAST			64
 // End of ASIX NIC Register ---------------------------------------------------
@@ -442,14 +471,14 @@ struct sw_desc {
 	unsigned int len;
 };
 
-#define ALIGN_8_BYTES(x)	((x + 0x7) & (~0x7))	
+#define ALIGN_8_BYTES(x)	((x + 0x7) & (~0x7))
 
 struct nic_tx_header {
 	u16	length;
 	u8	reserved[4];
 	u8	version;
 	u8	priority;
-}__packed;
+} __packed;
 
 /* Rx and Tx buffer descriptors. */
 struct ring_info {
@@ -479,21 +508,20 @@ struct ax_ethphy_status {
 	int asym_pause;
 	int link;
 };
-
 struct ax_private {
 	struct net_device      *dev;
 	struct pci_dev         *pdev;
 	struct xdma_dev        *xdev;
-#define MDIO_BRIDGE	0x204
 	struct mii_bus	       *mdio;
 	struct mdio_device     *mdiodev;
 
 	spinlock_t		mdio_lock;
 	spinlock_t		lock;
 	spinlock_t		rx_lock;
-
-	struct net_device_stats net_stats;
+	spinlock_t		txrx_timestamp_lock;
 	
+	struct net_device_stats net_stats;
+
 	struct ax_tx_list	tx_list[XDMA_CHANNEL_NUM_MAX];
 	struct ring_info	tx_buffers[TX_DESC_NUM];
 	struct ring_info	rx_buffers[RX_DESC_NUM];
@@ -506,7 +534,7 @@ struct ax_private {
 
 	struct mii_if_info      dsa_mii[4];
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,24)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 24)
 	struct napi_struct	napi;
 #endif
 
@@ -521,10 +549,15 @@ struct ax_private {
 	struct proc_dir_entry 	*pron_ifname_old;
 #define ASIX_PROC_IFNAME_NEW	"ifname_new"
 	struct proc_dir_entry 	*pron_ifname_new;
+#define ASIX_PROC_CORE_VERSION	"core_version"
+	struct proc_dir_entry	*proc_core_version;
 	char ax_netdev_oldname[24];
-	
+
 	struct timer_list 	ax_phy_timer;
 	struct ax_ethphy_status phy_status[4];
+#ifdef AX_MQ
+	int num_tx_queues;
+#endif
 };
 
 
@@ -545,7 +578,6 @@ struct xdma_transfer {
 	int last_in_request;		/* flag if last within request */
 	unsigned int len;
 
-	
 	dma_addr_t list_desc[DESC_LIST_NUM];
 	/* For TX */
 	u8 current_list;
@@ -590,7 +622,7 @@ struct xdma_engine {
 	u32 status;		/* last known status of device */
 	/* only used for MSIX mode to store per-engine interrupt mask value */
 	u32 interrupt_enable_mask_value;
-	
+
 	struct xdma_transfer *transfer;
 
 	/* Members applicable to AXI-ST C2H (cyclic) transfers */
@@ -619,6 +651,10 @@ struct xdma_engine {
 	spinlock_t desc_lock;		/* protects concurrent access */
 	dma_addr_t desc_bus;
 	struct xdma_desc *desc;
+
+#ifdef IRQ_AFFINITY_HINT
+	cpumask_t affinity_mask;
+#endif
 };
 
 struct xdma_user_irq {
@@ -629,14 +665,17 @@ struct xdma_user_irq {
 	wait_queue_head_t events_wq;  /* wait queue to sync waiting threads */
 	irq_handler_t handler;
 
-	void *dev;	
+	void *dev;
+#ifdef IRQ_AFFINITY_HINT
+	cpumask_t affinity_mask;
+#endif
 };
 
 /* XDMA PCIe device specific book-keeping */
 #define XDEV_FLAG_OFFLINE	0x1
 struct xdma_dev {
 	struct list_head list_head;
-        struct list_head rcu_node;
+	struct list_head rcu_node;
 
 	unsigned long magic;		/* structure ID for sanity checks */
 	struct pci_dev *pdev;	/* pci device struct from probe() */
@@ -661,13 +700,13 @@ struct xdma_dev {
 	int h2c_channel_max;
 
 	/* Interrupt management */
-	int irq_count;		/* interrupt counter */
 	int irq_line;		/* flag if irq allocated successfully */
 	int msi_enabled;	/* flag if msi was enabled for the device */
 	int msix_enabled;	/* flag if msi-x was enabled for the device */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0)
 	struct msix_entry entry[32];	/* msi-x vector/entry table */
 #endif
+
 	/* user IRQ management */
 	struct xdma_user_irq user_irq[MAX_USER_IRQ];
 	unsigned int mask_irq_user;
@@ -682,7 +721,10 @@ struct xdma_dev {
 	/* SD_Accel specific */
 	enum dev_capabilities capabilities;
 	u64 feature_id;
+
 };
+
+
 
 static inline int xdma_device_flag_check(struct xdma_dev *xdev, unsigned int f)
 {
@@ -698,8 +740,7 @@ static inline int xdma_device_flag_check(struct xdma_dev *xdev, unsigned int f)
 }
 
 static inline int xdma_device_flag_test_n_set(struct xdma_dev *xdev,
-					 unsigned int f)
-{
+		unsigned int f) {
 	unsigned long flags;
 	int rv = 0;
 
@@ -707,8 +748,9 @@ static inline int xdma_device_flag_test_n_set(struct xdma_dev *xdev,
 	if (xdev->flags & f) {
 		spin_unlock_irqrestore(&xdev->lock, flags);
 		rv = 1;
-	} else
+	} else {
 		xdev->flags |= f;
+	}
 	spin_unlock_irqrestore(&xdev->lock, flags);
 	return rv;
 }
@@ -722,9 +764,8 @@ static inline void xdma_device_flag_set(struct xdma_dev *xdev, unsigned int f)
 	spin_unlock_irqrestore(&xdev->lock, flags);
 }
 
-static inline void 
-xdma_device_flag_clear(struct xdma_dev *xdev, unsigned int f)
-{
+static inline void
+xdma_device_flag_clear(struct xdma_dev *xdev, unsigned int f) {
 	unsigned long flags;
 
 	spin_lock_irqsave(&xdev->lock, flags);
@@ -737,7 +778,8 @@ struct xdma_dev *xdev_find_by_pdev(struct pci_dev *pdev);
 void xdma_device_offline(struct pci_dev *pdev, void *dev_handle);
 void xdma_device_online(struct pci_dev *pdev, void *dev_handle);
 
-int xdma_desc_setup(struct xdma_dev *xdev, struct xdma_engine *engine);
+int xdma_desc_setup
+(struct xdma_dev *xdev, struct xdma_engine *engine, int xdma_desc_flag);
 
 struct xdma_transfer *engine_cyclic_stop(struct xdma_engine *engine);
 
@@ -750,8 +792,7 @@ u32 engine_status_read(struct xdma_engine *engine, bool clear, bool dump);
 void xdma_engine_stop(struct xdma_engine *engine);
 
 int ax_net_poll(struct napi_struct *napi, int budget);
-
-int xdma_user_isr_register(struct xdma_dev *xdev);
+int xdma_user_isr_register(struct xdma_dev *xdev, struct pci_dev *pdev);
 int xdma_user_isr_enable(struct xdma_dev *xdev, unsigned int mask);
 int xdma_user_isr_disable(struct xdma_dev *xdev, unsigned int mask);
 #endif /* XDMA_LIB_H */

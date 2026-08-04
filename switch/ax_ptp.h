@@ -1,6 +1,11 @@
 /******************************************************************************
  *     Copyright (c) 2020 ASIX Electronic Corporation All rights reserved.
  *
+ *     This is unpublished proprietary source code of ASIX Electronic
+ *     Corporation
+ *
+ *     The copyright notice above does not evidence any actual or intended
+ *     publication of such source code.
  *****************************************************************************/
 
 #ifndef __AX_PTP_H
@@ -32,7 +37,12 @@
 #define AX_UDP_PORT_OFFSET		22
 #define AX_PTP_EVENT_PORT_NUM		0x13F
 
+#define AX_SDSA                         0xDCDC
+#define AX_SDSA_TAG_LENGTH_TX           8
+#define AX_SDSA_TAG_LENGTH_RX           6
+
 /* EXPORTED SUBPROGRAM SPECIFICATIONS */
+
 void ax_ptp_init(struct net_device *netdev);
 void ax_ptp_remove(struct net_device *netdev);
 
